@@ -1,0 +1,94 @@
+name: 'CI: Lint & Ascend 910B Test'
+
+on:
+  pull_request:
+    branches:
+      - 'main'
+      - '*-dev'
+    paths:
+      - '.github/workflows/**'
+      - 'docker/Dockerfile**'
+      - 'lmcache_ascend/**'
+      - 'setup.py'
+      - 'pyproject.toml'
+      - 'requirement.txt'
+      - 'CMakeLists.txt'
+      - 'csrc/**'
+      - 'tests/**'
+  push:
+    branches:
+      - 'main'
+      - '*-dev'
+    paths:
+      - '.github/workflows/**'
+      - 'docker/Dockerfile**'
+      - 'lmcache_ascend/**'
+      - 'setup.py'
+      - 'pyproject.toml'
+      - 'requirement.txt'
+      - 'CMakeLists.txt'
+      - 'csrc/**'
+      - 'tests/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ==========================================
+  # JOB 1: CODE QUALITY (Runs on GitHub Cloud)
+  # ==========================================
+  lint:
+    name: Lint & Style Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Linting Tools
+        run: pip install pre-commit
+
+      - name: Run Pre-commit Hooks
+        run: pre-commit run --all-files
+
+  # ==========================================
+  # JOB 2: BUILD & TEST 
+  # ==========================================
+  build-and-test:
+    name: Build & Test (Native 910B)
+    needs: lint
+    # Target your specific runner using its labels
+    runs-on: [self-hosted, Linux, ARM64, 910b4]
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Build Docker Image (Native)
+        run: |
+          docker build \
+            -t lmcache-ascend:${{ github.sha }} \
+            -f docker/Dockerfile.a2.openEuler .
+
+      - name: Run Unit Tests (With NPU Access)
+        run: |
+          docker run --rm \
+            --device /dev/davinci0 \
+            --device /dev/davinci_manager \
+            --device /dev/devmm_svm \
+            --device /dev/hisi_hdc \
+            -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+            -v /usr/local/dcmi:/usr/local/dcmi \
+            lmcache-ascend:${{ github.sha }} \
+            pytest tests/v1
+
+      - name: Cleanup Docker Image
+        if: always() # Run even if tests fail
+        run: |
+          docker rmi lmcache-ascend:${{ github.sha }} || true

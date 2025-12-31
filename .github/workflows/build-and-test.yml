@@ -77,11 +77,13 @@ jobs:
             -f docker/Dockerfile.a2.openEuler .
 
       - name: Run Unit Tests (With NPU Access)
+        id: run_tests
         run: |
-          # 1. Generate a unique name so we can find it later
+          # Define a fixed name so we can find the container in the next step
           CONTAINER_NAME="ci-test-${{ github.sha }}"
+          echo "CONTAINER_NAME=$CONTAINER_NAME" >> $GITHUB_ENV
           
-          echo "Starting container: $CONTAINER_NAME"
+          echo "🚀 Starting container: $CONTAINER_NAME"
 
           docker run \
             --name "$CONTAINER_NAME" \
@@ -100,7 +102,30 @@ jobs:
               cd LMCache-Ascend && \
               python3 -u -m pytest -v -s -o log_cli=true tests/v1 2>&1 | tee /workspace/test_output.log"
 
-      - name: Cleanup Docker Image
-        if: always() # Run even if tests fail
+      # =========================================================
+      # 🚨 NEW STEP: BLACK BOX RECOVERY
+      # This runs even if the previous step crashed (if: always)
+      # =========================================================
+      - name: 🚨 Recover Logs from Container
+        if: always() 
         run: |
+          echo "Attempting to recover logs from $CONTAINER_NAME..."
+          
+          echo "=== DOCKER SYSTEM LOGS START ==="
+          docker logs $CONTAINER_NAME 2>&1 || echo "Could not retrieve docker logs"
+          echo "=== DOCKER SYSTEM LOGS END ==="
+          
+          echo ""
+          echo "=== INTERNAL FILE LOGS START ==="
+          docker cp $CONTAINER_NAME:/workspace/test_output.log ./final_logs.txt 2>/dev/null || echo "Log file not found inside container."
+          
+          # Print it to GitHub UI
+          cat ./final_logs.txt || true
+          echo "=== INTERNAL FILE LOGS END ==="
+
+      - name: Cleanup Docker Image & Container
+        if: always() 
+        run: |
+          # Now it is safe to delete the container
+          docker rm -f $CONTAINER_NAME || true
           docker rmi lmcache-ascend:${{ github.sha }} || true

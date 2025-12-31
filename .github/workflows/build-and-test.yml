@@ -87,7 +87,7 @@ jobs:
             -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
             -v /usr/local/dcmi:/usr/local/dcmi \
             lmcache-ascend:${{ github.sha }} \
-            /bin/bash -c "pip install pytest pytest-benchmark && cd LMCache-Ascend && python3 -m pytest -v -s -o log_cli=true tests/v1"
+            /bin/bash -c "pip install pytest pytest-benchmark && cd LMCache-Ascend && python3 -u -m pytest -v -s -o log_cli=true tests/v1"
 
       - name: Cleanup Docker Image
         if: always() # Run even if tests fail

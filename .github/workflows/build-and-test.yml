@@ -1,131 +1,86 @@
 name: 'CI: Lint & Ascend 910B Test'
 
 on:
-  pull_request:
-    branches:
-      - 'main'
-      - '*-dev'
-    paths:
-      - '.github/workflows/**'
-      - 'docker/Dockerfile**'
-      - 'lmcache_ascend/**'
-      - 'setup.py'
-      - 'pyproject.toml'
-      - 'requirement.txt'
-      - 'CMakeLists.txt'
-      - 'csrc/**'
-      - 'tests/**'
   push:
-    branches:
-      - 'main'
-      - '*-dev'
-    paths:
-      - '.github/workflows/**'
-      - 'docker/Dockerfile**'
-      - 'lmcache_ascend/**'
-      - 'setup.py'
-      - 'pyproject.toml'
-      - 'requirement.txt'
-      - 'CMakeLists.txt'
-      - 'csrc/**'
-      - 'tests/**'
+    branches: ['main']
+  pull_request:
+    branches: ['main', '*-dev']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ==========================================
-  # JOB 1: CODE QUALITY (Runs on GitHub Cloud)
-  # ==========================================
   lint:
     name: Lint & Style Check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-
-      - name: Install Linting Tools
-        run: pip install pre-commit
-
-      - name: Run Pre-commit Hooks
-        run: pre-commit run --all-files
+          python-version: "3.11"
+      - run: pip install pre-commit
+      - run: pre-commit run --all-files
 
   # ==========================================
-  # JOB 2: BUILD & TEST 
+  # JOB 2: TEST (Container Mode)
   # ==========================================
-  build-and-test:
-    name: Build & Test (Native 910B)
+  test-native:
+    name: Test on 910B (vLLM Image)
     needs: lint
-    # Target your specific runner using its labels
     runs-on: [self-hosted, Linux, ARM64, 910b4]
-    
+    timeout-minutes: 30
+
+    container:
+      image: quay.io/ascend/vllm-ascend:v0.10.2rc1-openeuler
+      
+      options: >-
+        --device /dev/davinci0
+        --device /dev/davinci_manager
+        --device /dev/devmm_svm
+        --device /dev/hisi_hdc
+        -v /usr/local/Ascend/driver:/usr/local/Ascend/driver
+        -v /usr/local/dcmi:/usr/local/dcmi
+        -v /etc/pki/ca-trust:/etc/pki/ca-trust
+        --user root
+
+    env:
+      SOC_VERSION: Ascend910B4
+      PIP_INDEX_URL: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+      LMCACHE_TRACK_USAGE: false
+      NO_CUDA_EXT: 1
+
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: true
 
-      - name: Build Docker Image (Native)
+      - name: 📦 Install LMCache & Build Project
         run: |
-          docker build \
-            -t lmcache-ascend:${{ github.sha }} \
-            -f docker/Dockerfile.a2.openEuler .
+          echo ">>> Setting up Pip..."
+          pip config set global.index-url ${{ env.PIP_INDEX_URL }}
+          
+          echo ">>> Installing LMCache Core..."
+          # From your Dockerfile: NO_CUDA_EXT=1 is set in 'env' above
+          pip install lmcache==0.3.7
 
-      - name: Run Unit Tests (With NPU Access)
-        id: run_tests
+          echo ">>> Building LMCache-Ascend..."
+          # We need to export these variables just like your Dockerfile does
+          export CPLUS_INCLUDE_PATH=/usr/include/c++/12:/usr/include/c++/12/backward:/usr/include/c++/12/aarch64-openEuler-linux/:$CPLUS_INCLUDE_PATH
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/devlib
+          
+          # Install in editable mode (-e) for testing
+          python3 -m pip install -v --no-build-isolation -e . 
+          
+      - name: 🧪 Run Unit Tests
         run: |
-          # Define a fixed name so we can find the container in the next step
-          CONTAINER_NAME="ci-test-${{ github.sha }}"
-          echo "CONTAINER_NAME=$CONTAINER_NAME" >> $GITHUB_ENV
+          # Ensure env vars persist for the test run
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/devlib
           
-          echo "🚀 Starting container: $CONTAINER_NAME"
+          echo ">>> Install pytest dependencies"
+          pip install pytest pytest-benchmark
 
-          docker run \
-            --name "$CONTAINER_NAME" \
-            --label "owner=ci-test-runner" \
-            --label "run.id=${{ github.run_id }}" \
-            --device /dev/davinci0 \
-            --device /dev/davinci_manager \
-            --device /dev/devmm_svm \
-            --device /dev/hisi_hdc \
-            -e LMCACHE_LOG_LEVEL=INFO \
-            -v /etc/pki/ca-trust:/etc/pki/ca-trust \
-            -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
-            -v /usr/local/dcmi:/usr/local/dcmi \
-            lmcache-ascend:${{ github.sha }} \
-            /bin/bash -c "pip install pytest pytest-benchmark && \
-              cd LMCache-Ascend && \
-              python3 -u -m pytest -v -s -o log_cli=true tests/v1 2>&1 | tee /workspace/test_output.log"
-
-      # =========================================================
-      # 🚨 NEW STEP: BLACK BOX RECOVERY
-      # This runs even if the previous step crashed (if: always)
-      # =========================================================
-      - name: 🚨 Recover Logs from Container
-        if: always() 
-        run: |
-          echo "Attempting to recover logs from $CONTAINER_NAME..."
-          
-          echo "=== DOCKER SYSTEM LOGS START ==="
-          docker logs $CONTAINER_NAME 2>&1 || echo "Could not retrieve docker logs"
-          echo "=== DOCKER SYSTEM LOGS END ==="
-          
-          echo ""
-          echo "=== INTERNAL FILE LOGS START ==="
-          docker cp $CONTAINER_NAME:/workspace/test_output.log ./final_logs.txt 2>/dev/null || echo "Log file not found inside container."
-          
-          # Print it to GitHub UI
-          cat ./final_logs.txt || true
-          echo "=== INTERNAL FILE LOGS END ==="
-
-      - name: Cleanup Docker Image & Container
-        if: always() 
-        run: |
-          # Now it is safe to delete the container
-          docker rm -f $CONTAINER_NAME || true
-          docker rmi lmcache-ascend:${{ github.sha }} || true
+          echo ">>> Starting Pytest..."
+          # Since we are using 'container:' mode, logging is reliable.
+          python3 -m pytest -v -s tests/v1

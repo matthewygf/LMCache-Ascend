@@ -4,6 +4,7 @@ import random
 
 # Third Party
 from lmcache.v1.memory_management import PinMemoryAllocator
+from lmcache_tests.v1.utils import check_mem_obj_equal
 import pytest
 import torch
 
@@ -12,7 +13,6 @@ import lmcache_ascend.c_ops as lmc_ops
 
 # Local
 from .utils import (
-    check_mem_obj_equal,
     check_paged_kv_cache_equal,
     generate_kv_cache_paged_list_tensors,
     generate_kv_cache_paged_list_tuple_tensors,

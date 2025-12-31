@@ -78,7 +78,13 @@ jobs:
 
       - name: Run Unit Tests (With NPU Access)
         run: |
-          docker run --rm \
+          # 1. Generate a unique name so we can find it later
+          CONTAINER_NAME="ci-test-${{ github.sha }}"
+          
+          echo "Starting container: $CONTAINER_NAME"
+
+          docker run \
+            --name "$CONTAINER_NAME" \
             --label "owner=ci-test-runner" \
             --label "run.id=${{ github.run_id }}" \
             --device /dev/davinci0 \
@@ -92,9 +98,9 @@ jobs:
             lmcache-ascend:${{ github.sha }} \
             /bin/bash -c "pip install pytest pytest-benchmark && \
               cd LMCache-Ascend && \
-              python3 -u -m pytest -v -s -o log_cli=true tests/v1"
+              python3 -u -m pytest -v -s -o log_cli=true tests/v1 2>&1 | tee /workspace/test_output.log"
 
       - name: Cleanup Docker Image
-        if: success() # Run even if tests fail
+        if: always() # Run even if tests fail
         run: |
           docker rmi lmcache-ascend:${{ github.sha }} || true

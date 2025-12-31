@@ -83,6 +83,7 @@ jobs:
             --device /dev/davinci_manager \
             --device /dev/devmm_svm \
             --device /dev/hisi_hdc \
+            -v /etc/pki/ca-trust:/etc/pki/ca-trust \
             -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
             -v /usr/local/dcmi:/usr/local/dcmi \
             lmcache-ascend:${{ github.sha }} \

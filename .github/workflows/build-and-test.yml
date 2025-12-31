@@ -79,17 +79,22 @@ jobs:
       - name: Run Unit Tests (With NPU Access)
         run: |
           docker run --rm \
+            --label "owner=ci-test-runner" \
+            --label "run.id=${{ github.run_id }}" \
             --device /dev/davinci0 \
             --device /dev/davinci_manager \
             --device /dev/devmm_svm \
             --device /dev/hisi_hdc \
+            -e LMCACHE_LOG_LEVEL=INFO \
             -v /etc/pki/ca-trust:/etc/pki/ca-trust \
             -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
             -v /usr/local/dcmi:/usr/local/dcmi \
             lmcache-ascend:${{ github.sha }} \
-            /bin/bash -c "pip install pytest pytest-benchmark && cd LMCache-Ascend && python3 -u -m pytest -v -s -o log_cli=true tests/v1"
+            /bin/bash -c "pip install pytest pytest-benchmark && \
+              cd LMCache-Ascend && \
+              python3 -u -m pytest -v -s -o log_cli=true tests/v1"
 
       - name: Cleanup Docker Image
-        if: always() # Run even if tests fail
+        if: success() # Run even if tests fail
         run: |
           docker rmi lmcache-ascend:${{ github.sha }} || true

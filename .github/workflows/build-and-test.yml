@@ -52,9 +52,13 @@ jobs:
       env:
         http_proxy: http://host.docker.internal:3128
         https_proxy: http://host.docker.internal:3128
+        HTTP_PROXY: http://host.docker.internal:3128
+        HTTPS_PROXY: http://host.docker.internal:3128
+        no_proxy: ${{ env.no_proxy }}
+        NO_PROXY: ${{ env.no_proxy }}
       options: >-
         --label owner=ci-test-runner
-        --add-host=host.docker.internal:host-gateway
+        --add-host=host.docker.internal:192.168.1.1
         --device /dev/davinci0
         --device /dev/davinci_manager
         --device /dev/devmm_svm

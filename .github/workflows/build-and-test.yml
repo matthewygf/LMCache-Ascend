@@ -47,9 +47,6 @@ jobs:
     runs-on: [self-hosted, Linux, ARM64, 910b4]
     timeout-minutes: 30
 
-    env:
-      BRIDGE_IP: ${{ secrets.DOCKER_BRIDGE_IP }}
-
     container:
       image: quay.io/ascend/vllm-ascend:v0.10.2rc1-openeuler
       env:
@@ -61,7 +58,7 @@ jobs:
 
       options: >-
         --label owner=ci-test-runner
-        --add-host=host.docker.internal:${{ env.BRIDGE_IP }}
+        --add-host=host.docker.internal:${{ vars.DOCKER_BRIDGE_IP }}
         --device /dev/davinci0
         --device /dev/davinci_manager
         --device /dev/devmm_svm

@@ -50,10 +50,6 @@ jobs:
     container:
       image: quay.io/ascend/vllm-ascend:v0.10.2rc1-openeuler
       env:
-        http_proxy: http://host.docker.internal:3128
-        https_proxy: http://host.docker.internal:3128
-        no_proxy: ${{ env.no_proxy }}
-
         SOC_VERSION: Ascend910B4
         PIP_INDEX_URL: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
         LMCACHE_TRACK_USAGE: false
@@ -63,8 +59,6 @@ jobs:
 
       options: >-
         --label owner=ci-test-runner
-        -e HTTP_PROXY=http://host.docker.internal:3128
-        -e HTTPS_PROXY=http://host.docker.internal:3128
         --add-host=host.docker.internal:192.168.1.1
         --device /dev/davinci0
         --device /dev/davinci_manager
@@ -74,7 +68,6 @@ jobs:
         -v /usr/local/dcmi:/usr/local/dcmi:ro
         -v /etc/pki/ca-trust:/etc/pki/ca-trust:ro
         --user root
-        --cap-drop=ALL
         --cap-add=SYS_PTRACE
 
       
@@ -84,6 +77,14 @@ jobs:
           fetch-depth: 0
           submodules: true
       
+      - name: 🔧 Fix Proxy Configuration
+        run: |
+          echo "Overwriting Runner Proxy Settings..."
+          echo "http_proxy=http://host.docker.internal:3128" >> $GITHUB_ENV
+          echo "https_proxy=http://host.docker.internal:3128" >> $GITHUB_ENV
+          echo "HTTP_PROXY=http://host.docker.internal:3128" >> $GITHUB_ENV
+          echo "HTTPS_PROXY=http://host.docker.internal:3128" >> $GITHUB_ENV
+
       - name: 🔧 Fix Git Safe Directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 

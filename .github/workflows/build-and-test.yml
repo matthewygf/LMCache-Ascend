@@ -3,8 +3,18 @@ name: 'CI: Lint & Ascend 910B Test'
 on:
   push:
     branches: ['main']
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
   pull_request:
     branches: ['main', '*-dev']
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
 
 permissions:
   contents: read
@@ -32,7 +42,7 @@ jobs:
   # JOB 2: TEST (Container Mode)
   # ==========================================
   test-native:
-    name: Test on 910B (vLLM Image)
+    name: Test on 910B
     needs: lint
     runs-on: [self-hosted, Linux, ARM64, 910b4]
     timeout-minutes: 30
@@ -46,9 +56,9 @@ jobs:
         --device /dev/davinci_manager
         --device /dev/devmm_svm
         --device /dev/hisi_hdc
-        -v /usr/local/Ascend/driver:/usr/local/Ascend/driver
-        -v /usr/local/dcmi:/usr/local/dcmi
-        -v /etc/pki/ca-trust:/etc/pki/ca-trust
+        -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+        -v /usr/local/dcmi:/usr/local/dcmi:ro
+        -v /etc/pki/ca-trust:/etc/pki/ca-trust:ro
         --user root
 
     env:
@@ -96,13 +106,17 @@ jobs:
           # 1. Setup Env
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/devlib
           
-          # 2. Disable "Exit on Error" so we can run the summary script even if tests fail
+          # 2. Disable Exit on Error (Manual Handling)
           set +e 
           
           echo ">>> Starting Pytest..."
+          echo "    - Console: Errors Only (Clean)"
+          echo "    - File:    Debug Logs (Verbose)"
           
-          # 3. Run Test (Pipe to tee for visibility + file)
-          #    We rely on ${PIPESTATUS[0]} to capture the python exit code, not tee's.
+          # 3. RUN PYTEST
+          # -W ignore:... : Suppress console spam from asyncio cleanup
+          # --log-cli-level=CRITICAL : Keep Console Quiet (Only real errors)
+          # --log-file=debug_logs.txt : Save Logs to File
           python3 -u -m pytest -v -s tests/v1 \
             -W "ignore:coroutine 'AsyncPQThreadPoolExecutor._worker' was never awaited" \
             -W "ignore:coroutine 'AsyncPQExecutor._worker' was never awaited" \
@@ -111,24 +125,20 @@ jobs:
             --tb=short \
             --junit-xml=test-results.xml \
             --log-cli-level=CRITICAL \
-            --color=yes 2>&1 | tee full_logs.txt
+            --log-file=debug_logs.txt \
+            --log-file-level=INFO
           
-          # Capture the exit code of the FIRST command in the pipe (pytest)
-          EXIT_CODE=${PIPESTATUS[0]}
+          # Capture Exit Code
+          EXIT_CODE=$?
           
-          # 4. Re-enable "Exit on Error" (good practice)
+          # 4. Re-enable Exit on Error
           set -e
           
           echo ""
           echo "============= TEST SUMMARY ============="
           echo "Final Exit Code: $EXIT_CODE"
           
-          # Grep the summary line (Passed/Failed count)
-          if [ -f full_logs.txt ]; then
-             grep -E "passed|failed|error|skipped" full_logs.txt | tail -1 || echo "Summary not found in logs."
-          fi
-          
-          # 5. Fail the job manually if needed
+          # 5. Fail if needed
           if [ $EXIT_CODE -ne 0 ]; then
              echo "❌ Tests Failed."
              exit $EXIT_CODE
@@ -137,18 +147,28 @@ jobs:
              exit 0
           fi
 
-      - name: 📤 Upload Full Test Logs
+      # 📤 ARTIFACT 1: The Verbose Logs (For Debugging)
+      - name: 📤 Upload Debug Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-910b
-          path: full_logs.txt
+          name: debug-logs-910b
+          path: debug_logs.txt
       
+      # 📤 ARTIFACT 2: The XML Summary (For Tools)
+      - name: 📤 Upload Test Results XML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-xml
+          path: test-results.xml
+
+      # 📊 REPORT: The Nice UI Table
       - name: 📊 Publish Test Report
-        if: always()  # Run even if tests fail
+        if: always()
         uses: dorny/test-reporter@v1
         with:
-          name: NPU Test Results            # Name of the Check Run
-          path: test-results.xml            # Path to the XML file we generated
-          reporter: java-junit              # Format (Pytest produces JUnit-style XML)
-          fail-on-error: false              # Don't fail the step itself if tests failed
+          name: NPU Test Results
+          path: test-results.xml
+          reporter: java-junit
+          fail-on-error: false

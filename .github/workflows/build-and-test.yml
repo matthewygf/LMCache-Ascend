@@ -55,6 +55,7 @@ jobs:
         LMCACHE_TRACK_USAGE: false
         NO_CUDA_EXT: 1
         NODE_EXTRA_CA_CERTS: /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+        LMCACHE_LOG_LEVEL: INFO
 
       options: >-
         --label owner=ci-test-runner

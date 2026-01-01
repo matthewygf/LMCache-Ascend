@@ -49,10 +49,12 @@ jobs:
 
     container:
       image: quay.io/ascend/vllm-ascend:v0.10.2rc1-openeuler
-      
+      env:
+        http_proxy: http://host.docker.internal:3128
+        https_proxy: http://host.docker.internal:3128
       options: >-
-        --network host
         --label owner=ci-test-runner
+        --add-host=host.docker.internal:host-gateway
         --device /dev/davinci0
         --device /dev/davinci_manager
         --device /dev/devmm_svm
@@ -61,6 +63,8 @@ jobs:
         -v /usr/local/dcmi:/usr/local/dcmi:ro
         -v /etc/pki/ca-trust:/etc/pki/ca-trust:ro
         --user root
+        --cap-drop=ALL
+        --cap-add=SYS_PTRACE
 
     env:
       SOC_VERSION: Ascend910B4

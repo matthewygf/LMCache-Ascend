@@ -50,11 +50,8 @@ jobs:
     container:
       image: quay.io/ascend/vllm-ascend:v0.10.2rc1-openeuler
       env:
-        http_proxy: http://host.docker.internal:3128
-        https_proxy: http://host.docker.internal:3128
         HTTP_PROXY: http://host.docker.internal:3128
         HTTPS_PROXY: http://host.docker.internal:3128
-        no_proxy: ${{ env.no_proxy }}
         NO_PROXY: ${{ env.no_proxy }}
         SOC_VERSION: Ascend910B4
         PIP_INDEX_URL: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple

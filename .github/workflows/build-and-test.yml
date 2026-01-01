@@ -90,8 +90,6 @@ jobs:
 
       - name: 📦 Install LMCache & Build Project
         run: |
-          echo ">>> Setting up Pip..."
-          pip config set global.index-url ${{ env.PIP_INDEX_URL }}
           
           echo ">>> Installing LMCache Core..."
           # From your Dockerfile: NO_CUDA_EXT=1 is set in 'env' above

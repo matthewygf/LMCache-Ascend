@@ -74,14 +74,35 @@ jobs:
           # Install in editable mode (-e) for testing
           python3 -m pip install -v --no-build-isolation -e . 
           
-      - name: 🧪 Run Unit Tests
+      - name: 🧪 Run Unit Tests (Artifact Mode)
+        id: test-step
         run: |
-          # Ensure env vars persist for the test run
+          # 1. Setup Env
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/devlib
           
-          echo ">>> Install pytest dependencies"
-          pip install pytest pytest-benchmark
-
           echo ">>> Starting Pytest..."
-          # Since we are using 'container:' mode, logging is reliable.
-          python3 -m pytest -v -s tests/v1
+          
+          # 2. Run Pytest -> Redirect ALL output to 'full_logs.txt'
+          #    We use '; EXIT_CODE=$?' so the script doesn't die immediately.
+          python3 -u -m pytest -v -s tests/v1 > full_logs.txt 2>&1 ; EXIT_CODE=$?
+          
+          # 3. Print the Log Summary to Console (Small & Readable)
+          echo ">>> Test Run Finished. Exit Code: $EXIT_CODE"
+          echo "=================== FAILURES ONLY ==================="
+          # Only print lines containing "FAILED" or "Error" to avoid flooding the UI
+          grep -E "FAILED|Error|ERROR|Captured" full_logs.txt -C 5 || echo "No explicit errors found in grep."
+          echo "====================================================="
+          echo "NOTE: Full logs are available in the 'Artifacts' section of this run."
+          
+          # 4. Fail the job if tests failed
+          if [ $EXIT_CODE -ne 0 ]; then
+             exit $EXIT_CODE
+          fi
+
+      # 5. NEW: Upload the full log file so you can download it
+      - name: 📤 Upload Full Test Logs
+        if: always()  # Run this even if tests failed
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-910b
+          path: full_logs.txt

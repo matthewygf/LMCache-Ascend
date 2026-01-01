@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: ['main', '*-dev']
 
+permissions:
+  contents: read
+  checks: write
+  actions: read
+  statuses: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -51,6 +57,7 @@ jobs:
       LMCACHE_TRACK_USAGE: false
       NO_CUDA_EXT: 1
       NODE_EXTRA_CA_CERTS: /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+      LMCACHE_LOG_LEVEL: WARNING # otherwise the logs get too noisy
 
     steps:
       - uses: actions/checkout@v4
@@ -97,6 +104,10 @@ jobs:
           # 3. Run Test (Pipe to tee for visibility + file)
           #    We rely on ${PIPESTATUS[0]} to capture the python exit code, not tee's.
           python3 -u -m pytest -v -s tests/v1 \
+            -W "ignore:coroutine 'AsyncPQThreadPoolExecutor._worker' was never awaited" \
+            -W "ignore:coroutine 'AsyncPQExecutor._worker' was never awaited" \
+            -W "ignore:Task was destroyed but it is pending!" \
+            -W "ignore:Exception ignored in" \
             --tb=short \
             --junit-xml=test-results.xml \
             --color=yes 2>&1 | tee full_logs.txt

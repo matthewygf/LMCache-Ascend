@@ -65,7 +65,6 @@ jobs:
         --label owner=ci-test-runner
         -e HTTP_PROXY=http://host.docker.internal:3128
         -e HTTPS_PROXY=http://host.docker.internal:3128
-        -e NO_PROXY=${{ env.no_proxy }}
         --add-host=host.docker.internal:192.168.1.1
         --device /dev/davinci0
         --device /dev/davinci_manager

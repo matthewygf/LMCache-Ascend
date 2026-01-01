@@ -52,6 +52,7 @@ jobs:
       
       options: >-
         --network host
+        --label owner=ci-test-runner
         --device /dev/davinci0
         --device /dev/davinci_manager
         --device /dev/devmm_svm

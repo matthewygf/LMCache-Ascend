@@ -50,6 +50,10 @@ jobs:
     container:
       image: quay.io/ascend/vllm-ascend:v0.10.2rc1-openeuler
       env:
+        http_proxy: http://host.docker.internal:3128
+        https_proxy: http://host.docker.internal:3128
+        no_proxy: ${{ env.no_proxy }}
+
         HTTP_PROXY: http://host.docker.internal:3128
         HTTPS_PROXY: http://host.docker.internal:3128
         NO_PROXY: ${{ env.no_proxy }}

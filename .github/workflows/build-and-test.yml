@@ -110,6 +110,7 @@ jobs:
             -W "ignore:Exception ignored in" \
             --tb=short \
             --junit-xml=test-results.xml \
+            --log-cli-level=CRITICAL \
             --color=yes 2>&1 | tee full_logs.txt
           
           # Capture the exit code of the FIRST command in the pipe (pytest)

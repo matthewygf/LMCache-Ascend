@@ -50,6 +50,7 @@ jobs:
       PIP_INDEX_URL: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
       LMCACHE_TRACK_USAGE: false
       NO_CUDA_EXT: 1
+      NODE_EXTRA_CA_CERTS: /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
 
     steps:
       - uses: actions/checkout@v4
@@ -74,35 +75,61 @@ jobs:
           # Install in editable mode (-e) for testing
           python3 -m pip install -v --no-build-isolation -e . 
           
-      - name: 🧪 Run Unit Tests (Artifact Mode)
+      - name: 🧪 Run Unit Tests
         id: test-step
+        shell: bash
         run: |
           # 1. Setup Env
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/$(uname -i)-linux/devlib
           
+          # 2. Disable "Exit on Error" so we can run the summary script even if tests fail
+          set +e 
+          
           echo ">>> Starting Pytest..."
           
-          # 2. Run Pytest -> Redirect ALL output to 'full_logs.txt'
-          #    We use '; EXIT_CODE=$?' so the script doesn't die immediately.
-          python3 -u -m pytest -v -s tests/v1 > full_logs.txt 2>&1 ; EXIT_CODE=$?
+          # 3. Run Test (Pipe to tee for visibility + file)
+          #    We rely on ${PIPESTATUS[0]} to capture the python exit code, not tee's.
+          python3 -u -m pytest -v -s tests/v1 \
+            --tb=short \
+            --junit-xml=test-results.xml \
+            --color=yes 2>&1 | tee full_logs.txt
           
-          # 3. Print the Log Summary to Console (Small & Readable)
-          echo ">>> Test Run Finished. Exit Code: $EXIT_CODE"
-          echo "=================== FAILURES ONLY ==================="
-          # Only print lines containing "FAILED" or "Error" to avoid flooding the UI
-          grep -E "FAILED|Error|ERROR|Captured" full_logs.txt -C 5 || echo "No explicit errors found in grep."
-          echo "====================================================="
-          echo "NOTE: Full logs are available in the 'Artifacts' section of this run."
+          # Capture the exit code of the FIRST command in the pipe (pytest)
+          EXIT_CODE=${PIPESTATUS[0]}
           
-          # 4. Fail the job if tests failed
+          # 4. Re-enable "Exit on Error" (good practice)
+          set -e
+          
+          echo ""
+          echo "============= TEST SUMMARY ============="
+          echo "Final Exit Code: $EXIT_CODE"
+          
+          # Grep the summary line (Passed/Failed count)
+          if [ -f full_logs.txt ]; then
+             grep -E "passed|failed|error|skipped" full_logs.txt | tail -1 || echo "Summary not found in logs."
+          fi
+          
+          # 5. Fail the job manually if needed
           if [ $EXIT_CODE -ne 0 ]; then
+             echo "❌ Tests Failed."
              exit $EXIT_CODE
+          else
+             echo "✅ Tests Passed."
+             exit 0
           fi
 
-      # 5. NEW: Upload the full log file so you can download it
       - name: 📤 Upload Full Test Logs
-        if: always()  # Run this even if tests failed
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-910b
           path: full_logs.txt
+      
+      - name: 📊 Publish Test Report
+        if: always()  # Run even if tests fail
+        uses: dorny/test-reporter@v1
+        with:
+          name: NPU Test Results            # Name of the Check Run
+          path: test-results.xml            # Path to the XML file we generated
+          reporter: java-junit              # Format (Pytest produces JUnit-style XML)
+          fail-on-error: false              # Don't fail the step itself if tests failed

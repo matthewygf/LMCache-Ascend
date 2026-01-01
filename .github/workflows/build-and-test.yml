@@ -57,6 +57,9 @@ jobs:
         with:
           fetch-depth: 0
           submodules: true
+      
+      - name: 🔧 Fix Git Safe Directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: 📦 Install LMCache & Build Project
         run: |
@@ -74,6 +77,10 @@ jobs:
           
           # Install in editable mode (-e) for testing
           python3 -m pip install -v --no-build-isolation -e . 
+      
+      - name: Install Pytest Dependencies
+        run: |
+          pip install pytest pytest-benchmark pytest-cov
           
       - name: 🧪 Run Unit Tests
         id: test-step

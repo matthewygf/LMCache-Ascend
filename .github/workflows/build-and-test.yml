@@ -73,6 +73,28 @@ jobs:
         with:
           fetch-depth: 0
           submodules: true
+      
+      - name: 🟡 Set Status to Running
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            
+            const sha = (context.payload.workflow_run && context.payload.workflow_run.head_sha) || 
+                        (context.payload.pull_request && context.payload.pull_request.head.sha) || 
+                        context.sha;
+
+            const target_url = `https://github.com/${owner}/${repo}/actions/runs/${context.runId}`;
+            
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha,
+              state: 'pending',
+              description: '🚀 Running tests... (Click Details to watch)',
+              context: '910B Unit Tests Status',
+              target_url: target_url
+            });
 
       - name: 🔧 Fix Git Safe Directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"

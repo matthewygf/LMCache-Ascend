@@ -91,7 +91,7 @@ jobs:
               repo,
               sha,
               state: 'pending',
-              description: '🚀 Running tests... (Click Details to watch)',
+              description: 'Running tests... (Click Details to watch)',
               context: '910B Unit Tests Status',
               target_url: target_url
             });

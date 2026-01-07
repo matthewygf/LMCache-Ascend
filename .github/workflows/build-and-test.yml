@@ -164,7 +164,9 @@ jobs:
         with:
           script: |
             const { owner, repo } = context.repo;
-            const sha = context.payload.workflow_run ? context.payload.workflow_run.head_sha : context.sha;
+            const sha = (context.payload.workflow_run && context.payload.workflow_run.head_sha) || 
+                        (context.payload.pull_request && context.payload.pull_request.head.sha) || 
+                        context.sha;
             const state = '${{ job.status }}' === 'success' ? 'success' : 'failure';
             const target_url = `https://github.com/${owner}/${repo}/actions/runs/${context.runId}`;
             await github.rest.repos.createCommitStatus({

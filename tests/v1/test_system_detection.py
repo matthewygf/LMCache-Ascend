@@ -49,6 +49,11 @@ def _create_mock_sysfs(tmpdir, topology):
     return node_base
 
 
+def _parse_first_cpu(cpulist_str):
+    """Parse the first CPU number from a cpulist string like '0-23,48-71'."""
+    return int(cpulist_str.replace("-", ",").split(",")[0])
+
+
 def _get_socket_numa_mask_with_base(numa_node, node_base):
     """
     Reimplementation of _get_socket_numa_mask that accepts a base path
@@ -64,7 +69,7 @@ def _get_socket_numa_mask_with_base(numa_node, node_base):
         if not cpulist_str:
             return 1 << numa_node
 
-        first_cpu = int(cpulist_str.replace("-", ",").split(",")[0])
+        first_cpu = _parse_first_cpu(cpulist_str)
 
         # Derive cpu_base from node_base
         # node_base = .../sys/devices/system/node
@@ -94,9 +99,7 @@ def _get_socket_numa_mask_with_base(numa_node, node_base):
             if not node_cpulist:
                 continue
 
-            node_first_cpu = int(
-                node_cpulist.replace("-", ",").split(",")[0]
-            )
+            node_first_cpu = _parse_first_cpu(node_cpulist)
             node_pkg_file = os.path.join(
                 cpu_base,
                 f"cpu{node_first_cpu}",

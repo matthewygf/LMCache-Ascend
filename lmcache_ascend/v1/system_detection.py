@@ -20,6 +20,11 @@ if torch.npu.is_available():
         get_gpu_pci_bus_id = None
 
 
+def _parse_first_cpu(cpulist_str: str) -> int:
+    """Parse the first CPU number from a cpulist string like '0-23,48-71'."""
+    return int(cpulist_str.replace("-", ",").split(",")[0])
+
+
 def _get_socket_numa_mask(numa_node: int) -> int:
     """
     Find all NUMA nodes on the same physical socket as the given NUMA node,
@@ -43,8 +48,7 @@ def _get_socket_numa_mask(numa_node: int) -> int:
         if not cpulist_str:
             return 1 << numa_node
 
-        # Parse the first CPU from the cpulist (format: "0-23,48-71")
-        first_cpu = int(cpulist_str.replace("-", ",").split(",")[0])
+        first_cpu = _parse_first_cpu(cpulist_str)
 
         # Get the physical socket (package) ID for this CPU
         pkg_file = (
@@ -72,9 +76,7 @@ def _get_socket_numa_mask(numa_node: int) -> int:
             if not node_cpulist:
                 continue
 
-            node_first_cpu = int(
-                node_cpulist.replace("-", ",").split(",")[0]
-            )
+            node_first_cpu = _parse_first_cpu(node_cpulist)
             node_pkg_file = (
                 f"/sys/devices/system/cpu/cpu{node_first_cpu}"
                 f"/topology/physical_package_id"

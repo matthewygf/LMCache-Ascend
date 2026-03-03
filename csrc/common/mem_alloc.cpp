@@ -52,10 +52,20 @@ uintptr_t alloc_pinned_numa_ptr(std::size_t size, int node) {
     throw std::runtime_error(std::string("mmap failed: ") + strerror(errno));
   }
 
-  // Maximum of 64 numa nodes
-  unsigned long mask = 1UL << node;
-  long maxnode = 8 * sizeof(mask);
-  int err = mbind(ptr, size, MPOL_BIND, &mask, maxnode,
+  const int bits_per_ulong = 8 * sizeof(unsigned long);
+  // Support up to 128 NUMA nodes (2 unsigned long words)
+  const int max_nodes = 2 * bits_per_ulong;
+  if (node < 0 || node >= max_nodes) {
+    munmap(ptr, size);
+    throw std::runtime_error("NUMA node " + std::to_string(node) +
+                             " exceeds maximum supported nodes " +
+                             std::to_string(max_nodes));
+  }
+  unsigned long nodemask[2] = {0UL, 0UL};
+  nodemask[node / bits_per_ulong] = 1UL << (node % bits_per_ulong);
+  // maxnode specifies the number of bits in nodemask
+  long maxnode = static_cast<long>(max_nodes);
+  int err = mbind(ptr, size, MPOL_BIND, nodemask, maxnode,
                   MPOL_MF_MOVE | MPOL_MF_STRICT);
   if (err != 0) {
     munmap(ptr, size);

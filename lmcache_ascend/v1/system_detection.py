@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
 from typing import Optional
 
 # Third Party
@@ -19,9 +20,92 @@ if torch.npu.is_available():
         get_gpu_pci_bus_id = None
 
 
+def _get_socket_numa_mask(numa_node: int) -> int:
+    """
+    Find all NUMA nodes on the same physical socket as the given NUMA node,
+    and return a bitmask with bits set for each sibling NUMA node.
+
+    On A2 servers, each socket typically has 2 NUMA nodes. This function
+    discovers both, allowing memory allocations to use the full DRAM capacity
+    of the socket.
+
+    Falls back to a single-node mask (1 << numa_node) if the socket topology
+    cannot be determined.
+    """
+    try:
+        # Read the CPU list for the given NUMA node
+        cpulist_file = (
+            f"/sys/devices/system/node/node{numa_node}/cpulist"
+        )
+        with open(cpulist_file) as f:
+            cpulist_str = f.read().strip()
+
+        if not cpulist_str:
+            return 1 << numa_node
+
+        # Parse the first CPU from the cpulist (format: "0-23,48-71")
+        first_cpu = int(cpulist_str.replace("-", ",").split(",")[0])
+
+        # Get the physical socket (package) ID for this CPU
+        pkg_file = (
+            f"/sys/devices/system/cpu/cpu{first_cpu}"
+            f"/topology/physical_package_id"
+        )
+        with open(pkg_file) as f:
+            socket_id = int(f.read().strip())
+
+        # Enumerate all NUMA nodes and find those on the same socket
+        mask = 0
+        node_base = "/sys/devices/system/node"
+        for entry in sorted(os.listdir(node_base)):
+            if not entry.startswith("node") or not entry[4:].isdigit():
+                continue
+            node_id = int(entry[4:])
+
+            node_cpulist_file = f"{node_base}/{entry}/cpulist"
+            try:
+                with open(node_cpulist_file) as f:
+                    node_cpulist = f.read().strip()
+            except OSError:
+                continue
+
+            if not node_cpulist:
+                continue
+
+            node_first_cpu = int(
+                node_cpulist.replace("-", ",").split(",")[0]
+            )
+            node_pkg_file = (
+                f"/sys/devices/system/cpu/cpu{node_first_cpu}"
+                f"/topology/physical_package_id"
+            )
+            try:
+                with open(node_pkg_file) as f:
+                    node_socket_id = int(f.read().strip())
+            except OSError:
+                continue
+
+            if node_socket_id == socket_id:
+                mask |= 1 << node_id
+
+        if mask == 0:
+            return 1 << numa_node
+        return mask
+
+    except Exception as e:
+        logger.warning(
+            f"Failed to detect sibling NUMA nodes for node {numa_node}: "
+            f"{e}. Falling back to single NUMA node."
+        )
+        return 1 << numa_node
+
+
 def _read_from_sys() -> Optional[NUMAMapping]:
     """
     Read NUMA mapping from system configuration.
+    Returns a NUMAMapping where the value is a bitmask of NUMA nodes
+    on the same physical socket as the device, enabling memory allocations
+    across all local NUMA nodes.
     """
 
     try:
@@ -36,7 +120,8 @@ def _read_from_sys() -> Optional[NUMAMapping]:
         # Sanitizing the output as on some hardware setups the numa_node variable
         # appeared to return with -1 value, causing failure.
         if numa_node >= 0:
-            return NUMAMapping(gpu_to_numa_mapping={device_index: numa_node})
+            numa_mask = _get_socket_numa_mask(numa_node)
+            return NUMAMapping(gpu_to_numa_mapping={device_index: numa_mask})
         else:
             logger.warning("No valid NUMA mapping for current device, returning None")
             return None

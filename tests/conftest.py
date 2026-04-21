@@ -11,8 +11,9 @@ import pytest
 # We import the function we just created to handle the git/alias logic
 from .bootstrap import TEST_ALIAS, prepare_environment
 
-# Skip multiprocess tests entirely — NPU does not support IPC sharing
-collect_ignore_glob = ["v1/multiprocess/test_*.py"]
+# Skip only the full cache-server integration test until MPCacheEngine store/retrieve
+# are ported to NPU. The IPC-serialization test (test_custom_types.py) is now collected.
+collect_ignore_glob = ["v1/multiprocess/test_cache_server.py"]
 
 # ==============================================================================
 # 1. RUN BOOTSTRAP

@@ -61,13 +61,13 @@ def _worker_process_deserialize_and_reconstruct(
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(),
-    reason="NPU is required for IPCWrapper multiprocessing tests",
+    not torch.npu.is_available(),
+    reason="NPU is required for AscendIPCWrapper multiprocessing tests",
 )
 def test_cudaipc_wrapper_multiprocess_serialization():
     """
-    Test CudaIPCWrapper serialization across processes using spawn method.
-    This verifies that CUDA IPC handles can be properly shared between processes.
+    Test AscendIPCWrapper (patched as CudaIPCWrapper) serialization across processes
+    using spawn. Verifies that NPU IPC handles can be shared between processes.
     """
     # Set multiprocessing start method to spawn
     ctx = mp.get_context("spawn")
@@ -79,9 +79,9 @@ def test_cudaipc_wrapper_multiprocess_serialization():
     wrappers = []
 
     for i in range(num_tensors):
-        # Create a tensor with known values
+        # Create a tensor with known values on NPU
         tensor = torch.full(
-            (2, 3), fill_value=float(i + 1), dtype=torch.float32, device="cuda"
+            (2, 3), fill_value=float(i + 1), dtype=torch.float32, device="npu:0"
         )
         tensors.append(tensor)
         wrapper = CudaIPCWrapper(tensor)

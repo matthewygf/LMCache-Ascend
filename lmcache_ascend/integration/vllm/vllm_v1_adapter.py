@@ -44,6 +44,13 @@ def wait_for_save(self):
 
     assert self.lmcache_engine is not None
 
+    # lmcache-ascend start -------------------
+    # NOTE (gingfung): we record the ordering event on the main stream
+    # and pass to our connector for storing
+    ordering_event = torch.npu.Event()
+    ordering_event.record()
+    # lmcache-ascend end -------------------
+
     for request in connector_metadata.requests:
         self.lmcache_engine.lookup_unpin(request.req_id)
 
@@ -59,7 +66,13 @@ def wait_for_save(self):
         assert isinstance(slot_mapping, torch.Tensor)
         assert len(slot_mapping) == len(token_ids)
 
-        slot_mapping = slot_mapping.to(self.device)
+        # lmcache-ascend start -------------------
+        # NOTE (gingfung): instead of blocking the main thread,
+        # we move the slot_mapping to the npu via the connector store stream
+        slot_mapping = slot_mapping.pin_memory()
+        with torch.npu.stream(self.lmcache_engine.gpu_connector.store_stream):
+            slot_mapping_npu = slot_mapping.to("npu", non_blocking=True)
+        # lmcache-ascend end -------------------
 
         skip_leading_tokens = save_spec.skip_leading_tokens
 
@@ -104,6 +117,8 @@ def wait_for_save(self):
             transfer_spec=request.disagg_spec,
             request_configs=request.request_configs,
             req_id=request.req_id,
+            ordering_event=ordering_event,
+            slot_mapping_npu=slot_mapping_npu,
         )
 
         if get_pp_group().is_last_rank:

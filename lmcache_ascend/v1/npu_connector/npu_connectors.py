@@ -849,7 +849,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping_npu"]
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
         if self.kv_format == KVCacheFormat.UNDEFINED:
@@ -1084,11 +1084,18 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     self.to_gpu(memory_obj, start, end, **kwargs)
 
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
+        # lmcache-ascend start -------------------
         # NOTE (gingfung):
         # Since no_sync is only consumed by us, for now we modify the kwargs directly.
         # We avoid per-object synchronization during batch transfers.
         # A single synchronization is performed at the end of the batch.
         kwargs["no_sync"] = True
+
+        ordering_event = kwargs.get("ordering_event", None)
+        if ordering_event is not None:
+            self.store_stream.wait_event(ordering_event)
+        # lmcache-ascend end -------------------
+
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             if is_310p():
                 self.from_gpu_310p(memory_obj, start, end, **kwargs)

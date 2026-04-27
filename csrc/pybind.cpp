@@ -64,6 +64,8 @@ PYBIND11_MODULE(c_ops, m) {
     return unregister_ptr(reinterpret_cast<void *>(ptr_addr));
   });
   m.def("multi_layer_kv_transfer", &multi_layer_kv_transfer);
+  m.def("multi_layer_kv_transfer_acl_batch",
+        &multi_layer_kv_transfer_acl_batch);
   m.def("fused_multi_layer_kv_transfer", &fused_multi_layer_kv_transfer);
   m.def("multi_layer_kv_transfer_310p", &multi_layer_kv_transfer_310p);
   m.def("single_layer_kv_transfer", &single_layer_kv_transfer_wrapper);

@@ -3,10 +3,13 @@
 #include "utils.h"
 #include <ATen/ATen.h>
 #include <Python.h>
+#include <acl/acl_rt.h>
 #include <pybind11/pybind11.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/csrc/framework/OpCommand.h>
 #include <torch_npu/csrc/npu/Module.h>
+#include <utility>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -64,6 +67,170 @@ void multi_layer_kv_transfer(
   cmd.Run();
   return;
 };
+
+void multi_layer_kv_transfer_acl_batch(
+    torch::Tensor &key_value,            // [kv, num_layer, num_tokens, hidden]
+    const torch::Tensor &key_value_ptrs, // [num_layers] or [num_layers * 2]
+    const torch::Tensor &slot_mapping,   // CPU [num_tokens]
+    const torch::Device &paged_memory_device, const int page_buffer_size,
+    const bool direction, const bool use_mla, const int kvcache_format_raw) {
+  TORCH_CHECK(key_value.dim() == 4,
+              "key_value must have shape [kv, num_layer, num_tokens, hidden]");
+  TORCH_CHECK(slot_mapping.device().is_cpu(),
+              "slot_mapping must be a CPU tensor for acl batch transfer");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kLong ||
+                  slot_mapping.scalar_type() == at::kInt,
+              "slot_mapping must be int64 or int32");
+  TORCH_CHECK(key_value.stride(3) == 1,
+              "key_value hidden dimension must be contiguous");
+
+  const int64_t kv_size = use_mla ? 1 : 2;
+  const int64_t num_layers = key_value.size(1);
+  const int64_t num_tokens = slot_mapping.size(0);
+  const int64_t hidden_dims = key_value.size(3);
+  const auto kvcache_format =
+      static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw);
+
+  TORCH_CHECK(key_value.size(0) >= kv_size,
+              "key_value kv dimension is smaller than expected kv_size");
+  TORCH_CHECK(key_value.size(2) >= num_tokens,
+              "key_value token dimension is smaller than slot_mapping length");
+
+  TORCH_CHECK(key_value_ptrs.device().is_cpu(),
+              "key_value_ptrs must be a CPU tensor for acl batch transfer");
+  TORCH_CHECK(key_value_ptrs.is_contiguous(),
+              "key_value_ptrs must be contiguous");
+  TORCH_CHECK(key_value_ptrs.scalar_type() == at::kLong,
+              "key_value_ptrs must be int64 pointer tensor");
+
+  const int64_t expected_ptrs =
+      kvcache_format == kvcache_ops::KVCacheFormat::SEPARATE_KV ? num_layers * 2
+                                                                : num_layers;
+  TORCH_CHECK(key_value_ptrs.numel() >= expected_ptrs,
+              "key_value_ptrs has too few entries: expected at least ",
+              expected_ptrs, ", got ", key_value_ptrs.numel());
+
+  std::vector<uintptr_t> page_ptrs(key_value_ptrs.numel());
+  const int64_t *ptr_data = key_value_ptrs.data_ptr<int64_t>();
+  for (int64_t i = 0; i < key_value_ptrs.numel(); ++i) {
+    page_ptrs[i] = static_cast<uintptr_t>(ptr_data[i]);
+  }
+
+  TORCH_CHECK(slot_mapping.is_contiguous(), "slot_mapping must be contiguous");
+  std::vector<int64_t> slots(num_tokens);
+  if (slot_mapping.scalar_type() == at::kLong) {
+    const int64_t *slot_data = slot_mapping.data_ptr<int64_t>();
+    for (int64_t i = 0; i < num_tokens; ++i) {
+      slots[i] = slot_data[i];
+    }
+  } else {
+    const int32_t *slot_data = slot_mapping.data_ptr<int32_t>();
+    for (int64_t i = 0; i < num_tokens; ++i) {
+      slots[i] = static_cast<int64_t>(slot_data[i]);
+    }
+  }
+
+  const size_t num_copies =
+      static_cast<size_t>(kv_size * num_layers * num_tokens);
+  if (num_copies == 0) {
+    return;
+  }
+
+  uint8_t *lmc_base = static_cast<uint8_t *>(key_value.data_ptr());
+  const int64_t lmc_kv_stride = key_value.stride(0);
+  const int64_t lmc_layer_stride = key_value.stride(1);
+  const int64_t lmc_token_stride = key_value.stride(2);
+  const int64_t element_size = key_value.element_size();
+  const bool can_coalesce_tokens = lmc_token_stride == hidden_dims;
+
+  std::vector<void *> dsts;
+  std::vector<void *> srcs;
+  std::vector<size_t> dest_maxs;
+  std::vector<size_t> sizes;
+  dsts.reserve(num_copies);
+  srcs.reserve(num_copies);
+  dest_maxs.reserve(num_copies);
+  sizes.reserve(num_copies);
+
+  for (int64_t cache_idx = 0; cache_idx < kv_size; ++cache_idx) {
+    for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+      uintptr_t page_base = 0;
+      int64_t paged_cache_offset_elements = 0;
+      if (kvcache_format == kvcache_ops::KVCacheFormat::SEPARATE_KV) {
+        page_base = page_ptrs[layer_idx * 2 + cache_idx];
+      } else {
+        page_base = page_ptrs[layer_idx];
+        paged_cache_offset_elements =
+            cache_idx * static_cast<int64_t>(page_buffer_size) * hidden_dims;
+      }
+
+      for (int64_t token_idx = 0; token_idx < num_tokens;) {
+        const int64_t slot = slots[token_idx];
+        TORCH_CHECK(slot >= 0, "slot_mapping contains negative slot at index ",
+                    token_idx);
+
+        int64_t run_tokens = 1;
+        if (can_coalesce_tokens) {
+          while (token_idx + run_tokens < num_tokens &&
+                 slots[token_idx + run_tokens] == slot + run_tokens) {
+            ++run_tokens;
+          }
+        }
+
+        uint8_t *lmc_ptr = lmc_base + (cache_idx * lmc_kv_stride +
+                                       layer_idx * lmc_layer_stride +
+                                       token_idx * lmc_token_stride) *
+                                          element_size;
+        uint8_t *paged_ptr = reinterpret_cast<uint8_t *>(
+            page_base +
+            (paged_cache_offset_elements + slot * hidden_dims) * element_size);
+        const size_t run_copy_bytes =
+            static_cast<size_t>(run_tokens * hidden_dims * element_size);
+
+        if (direction) {
+          dsts.push_back(lmc_ptr);
+          srcs.push_back(paged_ptr);
+        } else {
+          dsts.push_back(paged_ptr);
+          srcs.push_back(lmc_ptr);
+        }
+        dest_maxs.push_back(run_copy_bytes);
+        sizes.push_back(run_copy_bytes);
+        token_idx += run_tokens;
+      }
+    }
+  }
+
+  const c10::OptionalDeviceGuard device_guard(paged_memory_device);
+  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+  int32_t device_id = static_cast<int32_t>(paged_memory_device.index());
+  TORCH_CHECK(device_id >= 0,
+              "paged_memory_device must have an explicit device index");
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("multi_layer_kv_transfer_acl_batch");
+  cmd.SetCustomHandler([dsts = std::move(dsts),
+                        dest_maxs = std::move(dest_maxs),
+                        srcs = std::move(srcs), sizes = std::move(sizes),
+                        stream, direction, device_id]() mutable -> int {
+    aclrtMemcpyBatchAttr attr{};
+    aclrtMemLocation host_loc{0, ACL_MEM_LOCATION_TYPE_HOST};
+    aclrtMemLocation device_loc{static_cast<uint32_t>(device_id),
+                                ACL_MEM_LOCATION_TYPE_DEVICE};
+    attr.dstLoc = direction ? host_loc : device_loc;
+    attr.srcLoc = direction ? device_loc : host_loc;
+    size_t attr_index = 0;
+    size_t fail_index = 0;
+    aclError ret = aclrtMemcpyBatchAsync(
+        dsts.data(), dest_maxs.data(), srcs.data(), sizes.data(), sizes.size(),
+        &attr, &attr_index, 1, &fail_index, stream);
+    TORCH_CHECK(ret == ACL_ERROR_NONE,
+                "aclrtMemcpyBatchAsync failed: ret=", ret,
+                ", fail_index=", fail_index);
+    return 0;
+  });
+  cmd.Run();
+}
 
 void fused_multi_layer_kv_transfer(
     torch::Tensor &key_value,            // [kv, num_layer, num_tokens, hidden]

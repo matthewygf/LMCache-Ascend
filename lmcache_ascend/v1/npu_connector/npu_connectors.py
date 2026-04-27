@@ -810,16 +810,40 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
-        lmc_ops.multi_layer_kv_transfer(
-            memory_obj.tensor,
-            kv_cache_pointers,
-            slot_mapping[start:end],
-            self.kvcaches_device,
-            self.page_buffer_size,
-            False,
-            self.use_mla,
-            self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
-        )
+        load_gpu_buffer = self.load_gpu_buffer
+        if load_gpu_buffer is None or end - start != load_gpu_buffer.shape[2]:
+            lmc_ops.multi_layer_kv_transfer(
+                memory_obj.tensor,
+                kv_cache_pointers,
+                slot_mapping[start:end],
+                self.kvcaches_device,
+                self.page_buffer_size,
+                False,
+                self.use_mla,
+                self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
+            )
+        else:
+            assert load_gpu_buffer.device == self.kvcaches_device
+            tmp_gpu_buffer = load_gpu_buffer[:, :, : end - start, :]
+            logger.info(
+                "FUSED_KV_BUFFER_USE direction=to_gpu req_id=%s "
+                "range=[%d,%d) buffer_ptr=%s",
+                kwargs.get("req_id"),
+                start,
+                end,
+                load_gpu_buffer.data_ptr(),
+            )
+            lmc_ops.fused_multi_layer_kv_transfer(
+                memory_obj.tensor,
+                tmp_gpu_buffer,
+                kv_cache_pointers,  # src: paged KV cache
+                slot_mapping[start:end],
+                self.kvcaches_device,
+                self.page_buffer_size,
+                False,  # from_gpu
+                self.use_mla,
+                self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
+            )
 
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
@@ -851,40 +875,26 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        slot_mapping: torch.Tensor = kwargs["slot_mapping_npu"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+
         with torch.npu.stream(self.store_stream):
-            kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+            self._initialize_pointers(self.kvcaches)
 
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError("KV cache format is not initialized!")
+        assert self.kv_cache_pointers is not None
 
         with torch.npu.stream(self.store_stream):
-            # No staging buffer or token count mismatch
-            if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
-                lmc_ops.multi_layer_kv_transfer(
-                    memory_obj.tensor,
-                    kv_cache_pointers,
-                    slot_mapping[start:end],
-                    self.kvcaches_device,
-                    self.page_buffer_size,
-                    True,
-                    self.use_mla,
-                    self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
-                )
-            else:
-                assert self.gpu_buffer.device == self.kvcaches_device
-                tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
-                lmc_ops.fused_multi_layer_kv_transfer(
-                    memory_obj.tensor,  # dst: CPU buffer
-                    tmp_gpu_buffer,  # staging cache
-                    kv_cache_pointers,  # src: paged KV cache
-                    slot_mapping[start:end],
-                    self.kvcaches_device,
-                    self.page_buffer_size,
-                    True,  # from_gpu
-                    self.use_mla,
-                    self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
-                )
+            lmc_ops.multi_layer_kv_transfer_acl_batch(
+                memory_obj.tensor,
+                self.kv_cache_pointers,
+                slot_mapping[start:end],
+                self.kvcaches_device,
+                self.page_buffer_size,
+                True,
+                self.use_mla,
+                self.kv_format.value,  # 1:MERGED_KV / 2:SEPARATE_KV
+            )
         no_sync = kwargs.get("no_sync", False)
         if not no_sync and not memory_obj.tensor.is_cuda:
             # Force a synchronize if the target buffer is NOT CUDA device

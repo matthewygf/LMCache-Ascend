@@ -69,6 +69,13 @@ void multi_layer_kv_transfer(
     const torch::Device &paged_memory_device, const int page_buffer_size,
     const bool direction, const bool use_mla, const int kvcache_format_raw);
 
+void multi_layer_kv_transfer_acl_batch(
+    torch::Tensor &key_value,            // [kv, num_layer, num_tokens, hidden]
+    const torch::Tensor &key_value_ptrs, // [num_layers]
+    const torch::Tensor &slot_mapping,   // CPU [num_tokens]
+    const torch::Device &paged_memory_device, const int page_buffer_size,
+    const bool direction, const bool use_mla, const int kvcache_format_raw);
+
 void fused_multi_layer_kv_transfer(
     torch::Tensor &key_value,
     torch::Tensor &staging_cache, // staging buffer

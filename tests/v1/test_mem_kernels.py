@@ -14,10 +14,10 @@ import lmcache_ascend.c_ops as lmc_ops
 # Local
 from .utils import (
     check_paged_kv_cache_equal,
+    generate_dsa_kv_cache,
     generate_kv_cache_paged_list_tensors,
     generate_kv_cache_paged_list_tuple_tensors,
     generate_mla_kv_cache,
-    generate_dsa_kv_cache,
 )
 
 
@@ -1202,6 +1202,235 @@ def test_batched_fused_single_layer_kernel_separate_kv(
         del staging_cache
         del cpu_memory_objs
         del cpu_tensors
+        torch.npu.empty_cache()
+
+
+def _make_acl_batch_tuple_cache_pointers(kv_cache):
+    kv_size = len(kv_cache[0])
+    kv_cache_pointers = torch.empty(
+        len(kv_cache) * kv_size, dtype=torch.int64, device="cpu", pin_memory=True
+    )
+    for layer_id, layer_cache in enumerate(kv_cache):
+        for cache_id, cache in enumerate(layer_cache):
+            kv_cache_pointers[layer_id * kv_size + cache_id] = cache.data_ptr()
+    return kv_cache_pointers
+
+
+def _assert_acl_batch_cpu_buffer_matches_cache(
+    cpu_tensor, kv_cache, slot_mapping_cpu, hidden_dims
+):
+    slot_mapping_device = slot_mapping_cpu.to(
+        device=kv_cache[0][0].device, dtype=torch.long
+    )
+    for layer_id, layer_cache in enumerate(kv_cache):
+        expected_parts = []
+        for cache, hidden_dim in zip(layer_cache, hidden_dims, strict=False):
+            expected_parts.append(cache.reshape(-1, hidden_dim)[slot_mapping_device])
+        expected = torch.cat(expected_parts, dim=-1).cpu()
+        actual = cpu_tensor[
+            0, layer_id, : slot_mapping_cpu.numel(), : expected.size(-1)
+        ]
+        assert torch.equal(actual, expected), f"ACL batch mismatch at layer={layer_id}"
+
+
+def _run_acl_batch_tuple_format_roundtrip(
+    kv_cache_src,
+    kv_cache_dst,
+    slot_mapping_cpu,
+    page_buffer_size,
+    hidden_dims,
+    kvcache_format,
+    mem_allocator,
+):
+    num_layers = len(kv_cache_src)
+    total_hidden_dims = sum(hidden_dims)
+    dtype = kv_cache_src[0][0].dtype
+    mem_obj_shape = torch.Size(
+        [1, num_layers, slot_mapping_cpu.numel(), total_hidden_dims]
+    )
+    memory_obj = mem_allocator.allocate(mem_obj_shape, dtype)
+
+    kv_cache_pointers_src = _make_acl_batch_tuple_cache_pointers(kv_cache_src)
+    lmc_ops.multi_layer_kv_transfer_acl_batch(
+        memory_obj.tensor,
+        kv_cache_pointers_src,
+        slot_mapping_cpu,
+        kv_cache_src[0][0].device,
+        page_buffer_size,
+        True,  # from_gpu
+        True,  # use_mla
+        kvcache_format,
+        hidden_dims[0],
+        hidden_dims[1],
+        hidden_dims[2] if len(hidden_dims) == 3 else 0,
+    )
+    torch.npu.synchronize()
+
+    _assert_acl_batch_cpu_buffer_matches_cache(
+        memory_obj.tensor, kv_cache_src, slot_mapping_cpu, hidden_dims
+    )
+
+    kv_cache_pointers_dst = _make_acl_batch_tuple_cache_pointers(kv_cache_dst)
+    lmc_ops.multi_layer_kv_transfer_acl_batch(
+        memory_obj.tensor,
+        kv_cache_pointers_dst,
+        slot_mapping_cpu,
+        kv_cache_dst[0][0].device,
+        page_buffer_size,
+        False,  # to_gpu
+        True,  # use_mla
+        kvcache_format,
+        hidden_dims[0],
+        hidden_dims[1],
+        hidden_dims[2] if len(hidden_dims) == 3 else 0,
+    )
+    torch.npu.synchronize()
+
+    return memory_obj
+
+
+@pytest.mark.parametrize("num_tokens", [17, 128])
+@pytest.mark.parametrize("num_layers", [1, 4])
+@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
+def test_multi_layer_kv_transfer_acl_batch_mla_format(
+    num_tokens,
+    num_layers,
+    slot_dtype,
+):
+    device = "npu"
+    num_blocks = 64
+    block_size = 16
+    num_kv_heads = 1
+    kv_lora_rank = 512
+    qk_rope_head_dim = 128
+    dtype = torch.bfloat16
+    page_buffer_size = num_blocks * block_size
+
+    kv_cache_src = generate_mla_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    kv_cache_dst = generate_mla_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    slot_mapping_cpu = torch.tensor(
+        random.sample(range(0, page_buffer_size), num_tokens),
+        dtype=slot_dtype,
+        device="cpu",
+    )
+
+    total_elements = num_layers * num_tokens * (kv_lora_rank + qk_rope_head_dim)
+    mem_allocator = PinMemoryAllocator(total_elements * dtype.itemsize * 2)
+    try:
+        _run_acl_batch_tuple_format_roundtrip(
+            kv_cache_src,
+            kv_cache_dst,
+            slot_mapping_cpu,
+            page_buffer_size,
+            [kv_lora_rank, qk_rope_head_dim],
+            3,  # MLA_KV
+            mem_allocator,
+        )
+        check_paged_kv_cache_equal(
+            kv_cache_src,
+            kv_cache_dst,
+            slot_mapping_cpu.to(device=device, dtype=torch.long),
+            num_heads=num_kv_heads,
+            head_size=None,
+            kv_format=3,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+    finally:
+        mem_allocator.close()
+        torch.npu.empty_cache()
+
+
+@pytest.mark.parametrize("num_tokens", [17, 128])
+@pytest.mark.parametrize("num_layers", [1, 4])
+@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
+def test_multi_layer_kv_transfer_acl_batch_dsa_format(
+    num_tokens,
+    num_layers,
+    slot_dtype,
+):
+    device = "npu"
+    num_blocks = 64
+    block_size = 16
+    num_kv_heads = 1
+    kv_lora_rank = 512
+    qk_rope_head_dim = 128
+    dsa_head_dim = 128
+    dtype = torch.bfloat16
+    page_buffer_size = num_blocks * block_size
+
+    kv_cache_src = generate_dsa_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        dsa_head_dim=dsa_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    kv_cache_dst = generate_dsa_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        dsa_head_dim=dsa_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    slot_mapping_cpu = torch.tensor(
+        random.sample(range(0, page_buffer_size), num_tokens),
+        dtype=slot_dtype,
+        device="cpu",
+    )
+
+    total_hidden_dims = kv_lora_rank + qk_rope_head_dim + dsa_head_dim
+    total_elements = num_layers * num_tokens * total_hidden_dims
+    mem_allocator = PinMemoryAllocator(total_elements * dtype.itemsize * 2)
+    try:
+        _run_acl_batch_tuple_format_roundtrip(
+            kv_cache_src,
+            kv_cache_dst,
+            slot_mapping_cpu,
+            page_buffer_size,
+            [kv_lora_rank, qk_rope_head_dim, dsa_head_dim],
+            4,  # DSA_KV
+            mem_allocator,
+        )
+        check_paged_kv_cache_equal(
+            kv_cache_src,
+            kv_cache_dst,
+            slot_mapping_cpu.to(device=device, dtype=torch.long),
+            num_heads=num_kv_heads,
+            head_size=None,
+            kv_format=4,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            dsa_head_dim=dsa_head_dim,
+        )
+    finally:
+        mem_allocator.close()
         torch.npu.empty_cache()
 
 

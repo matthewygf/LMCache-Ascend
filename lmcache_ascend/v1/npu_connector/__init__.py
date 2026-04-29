@@ -74,7 +74,11 @@ def CreateNPUConnector(
             )
         else:
             conn = VLLMPagedMemNPUConnectorV2.from_metadata(
-                metadata, use_gpu, device, layout_hints=layout_hints
+                metadata,
+                use_gpu,
+                device,
+                layout_hints=layout_hints,
+                use_acl_batch=config.store_async,
             )
             return conn
     elif engine == EngineType.SGLANG:

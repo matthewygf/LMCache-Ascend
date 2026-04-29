@@ -441,6 +441,11 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         self.kv_lora_rank: int = 0
         self.qk_rope_head_dim: int = 0
         self.dsa_head_dim: int = 0
+        self.use_acl_batch: bool = kwargs.get("use_acl_batch", False)
+        if self.use_acl_batch:
+            self.transfer_func = lmc_ops.multi_layer_kv_transfer_acl_batch
+        else:
+            self.transfer_func = lmc_ops.multi_layer_kv_transfer
 
         super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
 
@@ -459,6 +464,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         use_gpu: bool = False,
         device: Optional[torch.device] = None,
         layout_hints: Optional[LayoutHints] = None,
+        use_acl_batch: bool = False,
     ) -> "VLLMPagedMemGPUConnectorV2":
         """Create a connector from LMCacheMetadata.
 
@@ -490,6 +496,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             num_kv_head=num_kv_head,
             head_size=head_size,
             layout_hints=layout_hints,
+            use_acl_batch=use_acl_batch,
         )
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
@@ -817,21 +824,40 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
         if self.kv_format == KVCacheFormat.UNDEFINED:
             raise ValueError("KV cache format is not initialized!")
         assert self.kv_cache_pointers is not None
 
+        slot_mapping_cpu: torch.Tensor = kwargs["slot_mapping"]
+        slot_mapping_npu: torch.Tensor = kwargs.get("slot_mapping_npu")
+        if not self.use_acl_batch:
+            assert slot_mapping_npu is not None, (
+                "slot_mapping_npu should be provided in kwargs."
+            )
+
         with torch.cuda.stream(self.store_stream):
             # No staging buffer or token count mismatch
-            if self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
-                lmc_ops.multi_layer_kv_transfer(
+            if self.use_acl_batch:
+                self.transfer_func(
+                    memory_obj.tensor,
+                    self.kv_cache_pointers,
+                    slot_mapping_cpu[start:end],
+                    self.kvcaches_device,
+                    self.page_buffer_size,
+                    True,
+                    self.use_mla,
+                    self.kv_format.value,
+                    self.kv_lora_rank,
+                    self.qk_rope_head_dim,
+                    self.dsa_head_dim,
+                )
+            elif self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
+                self.transfer_func(
                     memory_obj.tensor,
                     kv_cache_pointers,
-                    slot_mapping[start:end],
+                    slot_mapping_npu[start:end],
                     self.kvcaches_device,
                     self.page_buffer_size,
                     True,
@@ -848,7 +874,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     memory_obj.tensor,  # dst: CPU buffer
                     tmp_gpu_buffer,  # staging cache
                     kv_cache_pointers,  # src: paged KV cache
-                    slot_mapping[start:end],
+                    slot_mapping_npu[start:end],
                     self.kvcaches_device,
                     self.page_buffer_size,
                     True,  # from_gpu

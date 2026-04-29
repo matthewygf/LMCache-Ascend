@@ -73,11 +73,14 @@ void multi_layer_kv_transfer(
 };
 
 void multi_layer_kv_transfer_acl_batch(
-    torch::Tensor &key_value,            // [kv, num_layer, num_tokens, hidden]
-    const torch::Tensor &key_value_ptrs, // [num_layers] or [num_layers * 2]
-    const torch::Tensor &slot_mapping,   // CPU [num_tokens]
+    torch::Tensor &key_value, // [kv, num_layer, num_tokens, hidden]
+    const torch::Tensor
+        &key_value_ptrs, // [num_layers], [num_layers * 2], or [num_layers * 3]
+    const torch::Tensor &slot_mapping, // CPU [num_tokens]
     const torch::Device &paged_memory_device, const int page_buffer_size,
-    const bool direction, const bool use_mla, const int kvcache_format_raw) {
+    const bool direction, const bool use_mla, const int kvcache_format_raw,
+    const int64_t k_hidden_dims, const int64_t v_hidden_dims,
+    const int64_t dsa_hidden_dims) {
   TORCH_CHECK(key_value.dim() == 4,
               "key_value must have shape [kv, num_layer, num_tokens, hidden]");
   TORCH_CHECK(slot_mapping.device().is_cpu(),
@@ -88,14 +91,53 @@ void multi_layer_kv_transfer_acl_batch(
   TORCH_CHECK(key_value.stride(3) == 1,
               "key_value hidden dimension must be contiguous");
 
-  const int64_t kv_size = use_mla ? 1 : 2;
   const int64_t num_layers = key_value.size(1);
   const int64_t num_tokens = slot_mapping.size(0);
   const int64_t hidden_dims = key_value.size(3);
   const auto kvcache_format =
       static_cast<kvcache_ops::KVCacheFormat>(kvcache_format_raw);
 
-  TORCH_CHECK(key_value.size(0) >= kv_size,
+  int64_t kv_size = 0;
+  int64_t lmc_kv_size = 0;
+  std::vector<int64_t> component_hidden_dims;
+  std::vector<int64_t> component_lmc_hidden_offsets;
+
+  switch (kvcache_format) {
+  case kvcache_ops::KVCacheFormat::MERGED_KV:
+  case kvcache_ops::KVCacheFormat::SEPARATE_KV:
+    kv_size = use_mla ? 1 : 2;
+    lmc_kv_size = kv_size;
+    component_hidden_dims.assign(kv_size, hidden_dims);
+    component_lmc_hidden_offsets.assign(kv_size, 0);
+    break;
+  case kvcache_ops::KVCacheFormat::MLA_KV:
+    TORCH_CHECK(k_hidden_dims > 0 && v_hidden_dims > 0,
+                "MLA acl batch transfer requires k_hidden_dims and "
+                "v_hidden_dims");
+    TORCH_CHECK(hidden_dims >= k_hidden_dims + v_hidden_dims,
+                "key_value hidden dimension is smaller than MLA K/V dims");
+    kv_size = 2;
+    lmc_kv_size = 1;
+    component_hidden_dims = {k_hidden_dims, v_hidden_dims};
+    component_lmc_hidden_offsets = {0, k_hidden_dims};
+    break;
+  case kvcache_ops::KVCacheFormat::DSA_KV:
+    TORCH_CHECK(k_hidden_dims > 0 && v_hidden_dims > 0 && dsa_hidden_dims > 0,
+                "DSA acl batch transfer requires k_hidden_dims, "
+                "v_hidden_dims, and dsa_hidden_dims");
+    TORCH_CHECK(hidden_dims >= k_hidden_dims + v_hidden_dims + dsa_hidden_dims,
+                "key_value hidden dimension is smaller than DSA K/V/DSA dims");
+    kv_size = 3;
+    lmc_kv_size = 1;
+    component_hidden_dims = {k_hidden_dims, v_hidden_dims, dsa_hidden_dims};
+    component_lmc_hidden_offsets = {0, k_hidden_dims,
+                                    k_hidden_dims + v_hidden_dims};
+    break;
+  default:
+    TORCH_CHECK(false, "Unsupported KVCacheFormat: ", kvcache_format_raw);
+  }
+
+  TORCH_CHECK(key_value.size(0) >= lmc_kv_size,
               "key_value kv dimension is smaller than expected kv_size");
   TORCH_CHECK(key_value.size(2) >= num_tokens,
               "key_value token dimension is smaller than slot_mapping length");
@@ -108,8 +150,9 @@ void multi_layer_kv_transfer_acl_batch(
               "key_value_ptrs must be int64 pointer tensor");
 
   const int64_t expected_ptrs =
-      kvcache_format == kvcache_ops::KVCacheFormat::SEPARATE_KV ? num_layers * 2
-                                                                : num_layers;
+      kvcache_format == kvcache_ops::KVCacheFormat::MERGED_KV
+          ? num_layers
+          : num_layers * kv_size;
   TORCH_CHECK(key_value_ptrs.numel() >= expected_ptrs,
               "key_value_ptrs has too few entries: expected at least ",
               expected_ptrs, ", got ", key_value_ptrs.numel());
@@ -145,7 +188,6 @@ void multi_layer_kv_transfer_acl_batch(
   const int64_t lmc_layer_stride = key_value.stride(1);
   const int64_t lmc_token_stride = key_value.stride(2);
   const int64_t element_size = key_value.element_size();
-  const bool can_coalesce_tokens = lmc_token_stride == hidden_dims;
 
   std::vector<void *> dsts;
   std::vector<void *> srcs;
@@ -159,13 +201,23 @@ void multi_layer_kv_transfer_acl_batch(
   for (int64_t cache_idx = 0; cache_idx < kv_size; ++cache_idx) {
     for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
       uintptr_t page_base = 0;
+      const int64_t component_hidden_dims_value =
+          component_hidden_dims[cache_idx];
+      const int64_t lmc_cache_idx = lmc_kv_size == 1 ? 0 : cache_idx;
+      const int64_t lmc_hidden_offset = component_lmc_hidden_offsets[cache_idx];
+      const bool can_coalesce_tokens =
+          lmc_token_stride == component_hidden_dims_value;
+
       int64_t paged_cache_offset_elements = 0;
-      if (kvcache_format == kvcache_ops::KVCacheFormat::SEPARATE_KV) {
-        page_base = page_ptrs[layer_idx * 2 + cache_idx];
+      if (kvcache_format == kvcache_ops::KVCacheFormat::SEPARATE_KV ||
+          kvcache_format == kvcache_ops::KVCacheFormat::MLA_KV ||
+          kvcache_format == kvcache_ops::KVCacheFormat::DSA_KV) {
+        page_base = page_ptrs[layer_idx * kv_size + cache_idx];
       } else {
         page_base = page_ptrs[layer_idx];
-        paged_cache_offset_elements =
-            cache_idx * static_cast<int64_t>(page_buffer_size) * hidden_dims;
+        paged_cache_offset_elements = cache_idx *
+                                      static_cast<int64_t>(page_buffer_size) *
+                                      component_hidden_dims_value;
       }
 
       for (int64_t token_idx = 0; token_idx < num_tokens;) {
@@ -181,15 +233,17 @@ void multi_layer_kv_transfer_acl_batch(
           }
         }
 
-        uint8_t *lmc_ptr = lmc_base + (cache_idx * lmc_kv_stride +
-                                       layer_idx * lmc_layer_stride +
-                                       token_idx * lmc_token_stride) *
-                                          element_size;
+        uint8_t *lmc_ptr =
+            lmc_base +
+            (lmc_cache_idx * lmc_kv_stride + layer_idx * lmc_layer_stride +
+             token_idx * lmc_token_stride + lmc_hidden_offset) *
+                element_size;
         uint8_t *paged_ptr = reinterpret_cast<uint8_t *>(
             page_base +
-            (paged_cache_offset_elements + slot * hidden_dims) * element_size);
-        const size_t run_copy_bytes =
-            static_cast<size_t>(run_tokens * hidden_dims * element_size);
+            (paged_cache_offset_elements + slot * component_hidden_dims_value) *
+                element_size);
+        const size_t run_copy_bytes = static_cast<size_t>(
+            run_tokens * component_hidden_dims_value * element_size);
 
         if (direction) {
           dsts.push_back(lmc_ptr);

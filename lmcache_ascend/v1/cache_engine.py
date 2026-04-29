@@ -457,9 +457,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "Offsets should be set when hashes are provided during store"
             )
             num_to_store_tokens = sum(offsets)
-            kwargs["slot_mapping"] = torch.tensor(
-                kwargs["slot_mapping"], dtype=torch.long, device="npu"
-            )
 
         # lmcache-ascend start ---------------------
         if not self.is_store_async:

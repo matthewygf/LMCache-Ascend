@@ -69,7 +69,16 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("slot_mapping"), py::arg("paged_memory_device"),
         py::arg("page_buffer_size"), py::arg("direction"), py::arg("use_mla"),
         py::arg("kvcache_format_raw"), py::arg("k_hidden_dims") = 0,
-        py::arg("v_hidden_dims") = 0, py::arg("dsa_hidden_dims") = 0);
+        py::arg("v_hidden_dims") = 0, py::arg("dsa_hidden_dims") = 0,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("multi_layer_kv_transfer_acl_batch_sync",
+        &multi_layer_kv_transfer_acl_batch_sync, py::arg("key_value"),
+        py::arg("key_value_ptrs"), py::arg("slot_mapping"),
+        py::arg("paged_memory_device"), py::arg("page_buffer_size"),
+        py::arg("direction"), py::arg("use_mla"), py::arg("kvcache_format_raw"),
+        py::arg("k_hidden_dims") = 0, py::arg("v_hidden_dims") = 0,
+        py::arg("dsa_hidden_dims") = 0,
+        py::call_guard<py::gil_scoped_release>());
   m.def("fused_multi_layer_kv_transfer", &fused_multi_layer_kv_transfer);
   m.def("multi_layer_kv_transfer_310p", &multi_layer_kv_transfer_310p);
   m.def("single_layer_kv_transfer", &single_layer_kv_transfer_wrapper);

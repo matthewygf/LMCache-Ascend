@@ -183,6 +183,15 @@ def _patch_config():
         "If True, the kvcache will be stored asynchronously. ",
     }
 
+    lmcache.v1.config._CONFIG_DEFINITIONS["use_acl_batch_memcpy_sync"] = {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": "Whether to use aclrtMemcpyBatch instead of "
+        "aclrtMemcpyBatchAsync for ACL batch KV cache transfer. "
+        "This config is only used when store_async is set to True.",
+    }
+
     namespace_extras = {
         "validate": lmcache.v1.config._validate_config,
         "log_config": lmcache.v1.config._log_config,

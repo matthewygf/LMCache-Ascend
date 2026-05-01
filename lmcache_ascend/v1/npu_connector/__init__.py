@@ -79,6 +79,7 @@ def CreateNPUConnector(
                 device,
                 layout_hints=layout_hints,
                 use_acl_batch=config.store_async,
+                use_acl_batch_memcpy_sync=config.use_acl_batch_memcpy_sync,
             )
             return conn
     elif engine == EngineType.SGLANG:

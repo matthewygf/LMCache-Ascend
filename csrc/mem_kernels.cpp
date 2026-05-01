@@ -72,15 +72,22 @@ void multi_layer_kv_transfer(
   return;
 };
 
-void multi_layer_kv_transfer_acl_batch(
+namespace {
+struct AclBatchMemcpyPlan {
+  std::vector<void *> dsts;
+  std::vector<void *> srcs;
+  std::vector<size_t> dest_maxs;
+  std::vector<size_t> sizes;
+};
+
+AclBatchMemcpyPlan prepare_multi_layer_kv_transfer_acl_batch(
     torch::Tensor &key_value, // [kv, num_layer, num_tokens, hidden]
     const torch::Tensor
         &key_value_ptrs, // [num_layers], [num_layers * 2], or [num_layers * 3]
     const torch::Tensor &slot_mapping, // CPU [num_tokens]
-    const torch::Device &paged_memory_device, const int page_buffer_size,
-    const bool direction, const bool use_mla, const int kvcache_format_raw,
-    const int64_t k_hidden_dims, const int64_t v_hidden_dims,
-    const int64_t dsa_hidden_dims) {
+    const int page_buffer_size, const bool direction, const bool use_mla,
+    const int kvcache_format_raw, const int64_t k_hidden_dims,
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims) {
   TORCH_CHECK(key_value.dim() == 4,
               "key_value must have shape [kv, num_layer, num_tokens, hidden]");
   TORCH_CHECK(slot_mapping.device().is_cpu(),
@@ -179,8 +186,9 @@ void multi_layer_kv_transfer_acl_batch(
 
   const size_t num_copies =
       static_cast<size_t>(kv_size * num_layers * num_tokens);
+  AclBatchMemcpyPlan plan;
   if (num_copies == 0) {
-    return;
+    return plan;
   }
 
   uint8_t *lmc_base = static_cast<uint8_t *>(key_value.data_ptr());
@@ -189,14 +197,10 @@ void multi_layer_kv_transfer_acl_batch(
   const int64_t lmc_token_stride = key_value.stride(2);
   const int64_t element_size = key_value.element_size();
 
-  std::vector<void *> dsts;
-  std::vector<void *> srcs;
-  std::vector<size_t> dest_maxs;
-  std::vector<size_t> sizes;
-  dsts.reserve(num_copies);
-  srcs.reserve(num_copies);
-  dest_maxs.reserve(num_copies);
-  sizes.reserve(num_copies);
+  plan.dsts.reserve(num_copies);
+  plan.srcs.reserve(num_copies);
+  plan.dest_maxs.reserve(num_copies);
+  plan.sizes.reserve(num_copies);
 
   for (int64_t cache_idx = 0; cache_idx < kv_size; ++cache_idx) {
     for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
@@ -224,10 +228,15 @@ void multi_layer_kv_transfer_acl_batch(
         const int64_t slot = slots[token_idx];
         TORCH_CHECK(slot >= 0, "slot_mapping contains negative slot at index ",
                     token_idx);
+        TORCH_CHECK(slot < page_buffer_size,
+                    "slot_mapping contains out-of-range slot at index ",
+                    token_idx, ": slot=", slot,
+                    ", page_buffer_size=", page_buffer_size);
 
         int64_t run_tokens = 1;
         if (can_coalesce_tokens) {
           while (token_idx + run_tokens < num_tokens &&
+                 slot + run_tokens < page_buffer_size &&
                  slots[token_idx + run_tokens] == slot + run_tokens) {
             ++run_tokens;
           }
@@ -238,56 +247,124 @@ void multi_layer_kv_transfer_acl_batch(
             (lmc_cache_idx * lmc_kv_stride + layer_idx * lmc_layer_stride +
              token_idx * lmc_token_stride + lmc_hidden_offset) *
                 element_size;
+        int64_t paged_offset_elements =
+            paged_cache_offset_elements + slot * component_hidden_dims_value;
         uint8_t *paged_ptr = reinterpret_cast<uint8_t *>(
-            page_base +
-            (paged_cache_offset_elements + slot * component_hidden_dims_value) *
-                element_size);
+            page_base + paged_offset_elements * element_size);
         const size_t run_copy_bytes = static_cast<size_t>(
             run_tokens * component_hidden_dims_value * element_size);
 
         if (direction) {
-          dsts.push_back(lmc_ptr);
-          srcs.push_back(paged_ptr);
+          plan.dsts.push_back(lmc_ptr);
+          plan.srcs.push_back(paged_ptr);
         } else {
-          dsts.push_back(paged_ptr);
-          srcs.push_back(lmc_ptr);
+          plan.dsts.push_back(paged_ptr);
+          plan.srcs.push_back(lmc_ptr);
         }
-        dest_maxs.push_back(run_copy_bytes);
-        sizes.push_back(run_copy_bytes);
+        plan.dest_maxs.push_back(run_copy_bytes);
+        plan.sizes.push_back(run_copy_bytes);
         token_idx += run_tokens;
       }
     }
   }
 
+  return plan;
+}
+
+aclrtMemcpyBatchAttr make_acl_batch_attr(const bool direction,
+                                         const int32_t device_id) {
+  aclrtMemcpyBatchAttr attr{};
+  aclrtMemLocation host_loc{0, ACL_MEM_LOCATION_TYPE_HOST};
+  aclrtMemLocation device_loc{static_cast<uint32_t>(device_id),
+                              ACL_MEM_LOCATION_TYPE_DEVICE};
+  attr.dstLoc = direction ? host_loc : device_loc;
+  attr.srcLoc = direction ? device_loc : host_loc;
+  return attr;
+}
+
+void run_multi_layer_kv_transfer_acl_batch(
+    AclBatchMemcpyPlan plan, const torch::Device &paged_memory_device,
+    const bool direction, const bool use_sync) {
+  if (plan.sizes.empty()) {
+    return;
+  }
+
   const c10::OptionalDeviceGuard device_guard(paged_memory_device);
-  const aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
   int32_t device_id = static_cast<int32_t>(paged_memory_device.index());
   TORCH_CHECK(device_id >= 0,
               "paged_memory_device must have an explicit device index");
 
-  at_npu::native::OpCommand cmd;
-  cmd.Name("multi_layer_kv_transfer_acl_batch");
-  cmd.SetCustomHandler([dsts = std::move(dsts),
-                        dest_maxs = std::move(dest_maxs),
-                        srcs = std::move(srcs), sizes = std::move(sizes),
-                        stream, direction, device_id]() mutable -> int {
-    aclrtMemcpyBatchAttr attr{};
-    aclrtMemLocation host_loc{0, ACL_MEM_LOCATION_TYPE_HOST};
-    aclrtMemLocation device_loc{static_cast<uint32_t>(device_id),
-                                ACL_MEM_LOCATION_TYPE_DEVICE};
-    attr.dstLoc = direction ? host_loc : device_loc;
-    attr.srcLoc = direction ? device_loc : host_loc;
+  const auto npuStream = c10_npu::getCurrentNPUStream();
+  if (use_sync) {
+    npuStream.synchronize();
+    aclrtMemcpyBatchAttr attr = make_acl_batch_attr(direction, device_id);
     size_t attr_index = 0;
     size_t fail_index = 0;
-    aclError ret = aclrtMemcpyBatchAsync(
-        dsts.data(), dest_maxs.data(), srcs.data(), sizes.data(), sizes.size(),
-        &attr, &attr_index, 1, &fail_index, stream);
-    TORCH_CHECK(ret == ACL_ERROR_NONE,
-                "aclrtMemcpyBatchAsync failed: ret=", ret,
+
+    aclError ret =
+        aclrtMemcpyBatch(plan.dsts.data(), plan.dest_maxs.data(),
+                         plan.srcs.data(), plan.sizes.data(), plan.sizes.size(),
+                         &attr, &attr_index, 1, &fail_index);
+    TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtMemcpyBatch failed: ret=", ret,
                 ", fail_index=", fail_index);
-    return 0;
-  });
+    return;
+  }
+
+  auto stream = npuStream.stream(false);
+
+  at_npu::native::OpCommand cmd;
+  cmd.Name("multi_layer_kv_transfer_acl_batch");
+  cmd.SetCustomHandler(
+      [plan = std::move(plan), stream, direction, device_id]() mutable -> int {
+        aclrtMemcpyBatchAttr attr = make_acl_batch_attr(direction, device_id);
+        size_t attr_index = 0;
+        size_t fail_index = 0;
+
+        aclError ret = aclrtMemcpyBatchAsync(
+            plan.dsts.data(), plan.dest_maxs.data(), plan.srcs.data(),
+            plan.sizes.data(), plan.sizes.size(), &attr, &attr_index, 1,
+            &fail_index, stream);
+        TORCH_CHECK(ret == ACL_ERROR_NONE,
+                    "aclrtMemcpyBatchAsync failed: ret=", ret,
+                    ", fail_index=", fail_index);
+        return 0;
+      });
   cmd.Run();
+}
+} // namespace
+
+void multi_layer_kv_transfer_acl_batch(
+    torch::Tensor &key_value, // [kv, num_layer, num_tokens, hidden]
+    const torch::Tensor
+        &key_value_ptrs, // [num_layers], [num_layers * 2], or [num_layers * 3]
+    const torch::Tensor &slot_mapping, // CPU [num_tokens]
+    const torch::Device &paged_memory_device, const int page_buffer_size,
+    const bool direction, const bool use_mla, const int kvcache_format_raw,
+    const int64_t k_hidden_dims, const int64_t v_hidden_dims,
+    const int64_t dsa_hidden_dims) {
+  AclBatchMemcpyPlan plan = prepare_multi_layer_kv_transfer_acl_batch(
+      key_value, key_value_ptrs, slot_mapping, page_buffer_size, direction,
+      use_mla, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
+  run_multi_layer_kv_transfer_acl_batch(std::move(plan), paged_memory_device,
+                                        direction, false);
+}
+
+void multi_layer_kv_transfer_acl_batch_sync(
+    torch::Tensor &key_value, // [kv, num_layer, num_tokens, hidden]
+    const torch::Tensor
+        &key_value_ptrs, // [num_layers], [num_layers * 2], or [num_layers * 3]
+    const torch::Tensor &slot_mapping, // CPU [num_tokens]
+    const torch::Device &paged_memory_device, const int page_buffer_size,
+    const bool direction, const bool use_mla, const int kvcache_format_raw,
+    const int64_t k_hidden_dims, const int64_t v_hidden_dims,
+    const int64_t dsa_hidden_dims) {
+  AclBatchMemcpyPlan plan = prepare_multi_layer_kv_transfer_acl_batch(
+      key_value, key_value_ptrs, slot_mapping, page_buffer_size, direction,
+      use_mla, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims);
+  run_multi_layer_kv_transfer_acl_batch(std::move(plan), paged_memory_device,
+                                        direction, true);
 }
 
 void fused_multi_layer_kv_transfer(

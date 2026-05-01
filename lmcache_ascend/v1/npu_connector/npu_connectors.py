@@ -442,8 +442,14 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         self.qk_rope_head_dim: int = 0
         self.dsa_head_dim: int = 0
         self.use_acl_batch: bool = kwargs.get("use_acl_batch", False)
+        self.use_acl_batch_memcpy_sync: bool = kwargs.get(
+            "use_acl_batch_memcpy_sync", False
+        )
         if self.use_acl_batch:
-            self.transfer_func = lmc_ops.multi_layer_kv_transfer_acl_batch
+            if self.use_acl_batch_memcpy_sync:
+                self.transfer_func = lmc_ops.multi_layer_kv_transfer_acl_batch_sync
+            else:
+                self.transfer_func = lmc_ops.multi_layer_kv_transfer_acl_batch
         else:
             self.transfer_func = lmc_ops.multi_layer_kv_transfer
 
@@ -465,6 +471,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         device: Optional[torch.device] = None,
         layout_hints: Optional[LayoutHints] = None,
         use_acl_batch: bool = False,
+        use_acl_batch_memcpy_sync: bool = False,
     ) -> "VLLMPagedMemGPUConnectorV2":
         """Create a connector from LMCacheMetadata.
 
@@ -473,6 +480,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             use_gpu: Whether to use GPU intermediate buffer.
             device: The device to use for the connector.
             layout_hints: Optional KV layout hints from the serving engine.
+            use_acl_batch: Whether to use ACL batch KV cache transfer.
+            use_acl_batch_memcpy_sync: Whether ACL batch transfer should use
+                aclrtMemcpyBatch instead of aclrtMemcpyBatchAsync.
 
         Returns:
             A new instance of VLLMPagedMemNPUConnectorV2.
@@ -497,6 +507,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             head_size=head_size,
             layout_hints=layout_hints,
             use_acl_batch=use_acl_batch,
+            use_acl_batch_memcpy_sync=use_acl_batch_memcpy_sync,
         )
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
@@ -1092,13 +1103,12 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         # A single synchronization is performed at the end of the batch.
         kwargs["no_sync"] = True
 
-        ordering_event = kwargs.pop("ordering_event", None)
         current_stream = torch.npu.current_stream()
-        with torch.npu.stream(self.store_stream):
-            if ordering_event is not None:
-                self.store_stream.wait_event(ordering_event)
-            else:
-                self.store_stream.wait_stream(current_stream)
+        ordering_event = kwargs.pop("ordering_event", None)
+        if ordering_event is not None:
+            self.store_stream.wait_event(ordering_event)
+        else:
+            self.store_stream.wait_stream(current_stream)
 
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             if is_310p():
@@ -1106,6 +1116,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             else:
                 self.from_gpu(memory_obj, start, end, **kwargs)
 
+        # Even when aclrtMemcpyBatch is host-synchronous, from_gpu can enqueue
+        # NPU-side setup on store_stream, such as KV pointer tensor copies used
+        # by the later to_gpu kernel. Drain that work before publishing memory.
         self.store_stream.synchronize()
 
     def get_shape(self, num_tokens: int) -> torch.Size:

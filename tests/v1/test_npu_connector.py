@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # ruff: noqa: E501
 # Standard
+from types import SimpleNamespace
 from unittest.mock import patch
 import random
 
@@ -29,6 +30,7 @@ from lmcache_ascend.v1.gpu_connector.npu_connectors import (
     VLLMPagedMemLayerwiseNPUConnector,
     VLLMPagedMemNPUConnectorV2,
 )
+from lmcache_ascend.v1.kv_format import KVCacheFormat
 from tests.v1.utils import check_sglang_npu_kv_cache_equal, generate_sglang_npu_kv_cache
 import lmcache_ascend.c_ops as lmc_ops
 
@@ -79,6 +81,52 @@ def test_vllm_paged_connector_v2_to_npu_bench(benchmark):
 
     with patch(target_patch, new=VLLMPagedMemNPUConnectorV2):
         original_test_vllm_paged_connector_v2_to_gpu_bench(benchmark)
+
+
+def test_vllm_paged_connector_dsa_component_major_to_gpu_routes_acl(monkeypatch):
+    connector = VLLMPagedMemNPUConnectorV2.__new__(VLLMPagedMemNPUConnectorV2)
+    connector.kv_format = KVCacheFormat.DSA_KV
+    connector.use_acl_batch = False
+    connector.use_dsa_component_major_acl = False
+    connector.kvcaches = [object()]
+
+    monkeypatch.setattr(
+        connector,
+        "initialize_kvcaches_ptr",
+        lambda **kwargs: setattr(connector, "kvcaches", kwargs["kvcaches"]),
+    )
+    monkeypatch.setattr(connector, "_initialize_pointers", lambda kvcaches: object())
+
+    calls = []
+    monkeypatch.setattr(
+        connector,
+        "_dsa_component_major_transfer",
+        lambda memory_obj, slot_mapping, start, end, direction: calls.append(
+            (memory_obj, slot_mapping, start, end, direction)
+        ),
+    )
+
+    memory_obj = SimpleNamespace(
+        tensor=torch.empty(1),
+        metadata=SimpleNamespace(fmt=MemoryFormat.KV_DSA_COMPONENT_MAJOR),
+    )
+    slot_mapping = torch.arange(4, dtype=torch.int64)
+
+    connector.to_gpu(
+        memory_obj,
+        1,
+        3,
+        kvcaches=[object()],
+        slot_mapping=slot_mapping,
+    )
+
+    assert len(calls) == 1
+    called_memory_obj, called_slot_mapping, called_start, called_end, direction = calls[
+        0
+    ]
+    assert called_memory_obj is memory_obj
+    assert called_slot_mapping is slot_mapping
+    assert (called_start, called_end, direction) == (1, 3, False)
 
 
 @pytest.mark.parametrize("use_gpu", [True])

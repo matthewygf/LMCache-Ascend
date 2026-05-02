@@ -73,11 +73,32 @@ void multi_layer_kv_transfer(
 };
 
 namespace {
+struct Acl2DMemcpyEntry {
+  void *dst;
+  const void *src;
+  size_t dpitch;
+  size_t spitch;
+  size_t width;
+  size_t height;
+};
+
+enum class AclMemcpyOpKind {
+  Copy1D,
+  Copy2D,
+};
+
+struct AclMemcpyOp {
+  AclMemcpyOpKind kind;
+  size_t index;
+};
+
 struct AclBatchMemcpyPlan {
   std::vector<void *> dsts;
   std::vector<void *> srcs;
   std::vector<size_t> dest_maxs;
   std::vector<size_t> sizes;
+  std::vector<Acl2DMemcpyEntry> copies_2d;
+  std::vector<AclMemcpyOp> ops;
 };
 
 AclBatchMemcpyPlan prepare_multi_layer_kv_transfer_acl_batch(
@@ -87,7 +108,8 @@ AclBatchMemcpyPlan prepare_multi_layer_kv_transfer_acl_batch(
     const torch::Tensor &slot_mapping, // CPU [num_tokens]
     const int page_buffer_size, const bool direction, const bool use_mla,
     const int kvcache_format_raw, const int64_t k_hidden_dims,
-    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims) {
+    const int64_t v_hidden_dims, const int64_t dsa_hidden_dims,
+    const bool component_major = false) {
   TORCH_CHECK(key_value.dim() == 4,
               "key_value must have shape [kv, num_layer, num_tokens, hidden]");
   TORCH_CHECK(slot_mapping.device().is_cpu(),
@@ -108,6 +130,7 @@ AclBatchMemcpyPlan prepare_multi_layer_kv_transfer_acl_batch(
   int64_t lmc_kv_size = 0;
   std::vector<int64_t> component_hidden_dims;
   std::vector<int64_t> component_lmc_hidden_offsets;
+  std::vector<int64_t> component_lmc_plane_offsets;
 
   switch (kvcache_format) {
   case kvcache_ops::KVCacheFormat::MERGED_KV:
@@ -148,6 +171,20 @@ AclBatchMemcpyPlan prepare_multi_layer_kv_transfer_acl_batch(
               "key_value kv dimension is smaller than expected kv_size");
   TORCH_CHECK(key_value.size(2) >= num_tokens,
               "key_value token dimension is smaller than slot_mapping length");
+  TORCH_CHECK(!component_major || lmc_kv_size == 1,
+              "component-major acl batch transfer is only supported for "
+              "single-plane LMCache formats such as MLA_KV and DSA_KV");
+
+  int64_t component_lmc_plane_offset = 0;
+  component_lmc_plane_offsets.reserve(kv_size);
+  for (int64_t component_hidden_dim : component_hidden_dims) {
+    component_lmc_plane_offsets.push_back(component_lmc_plane_offset);
+    component_lmc_plane_offset +=
+        num_layers * num_tokens * component_hidden_dim;
+  }
+  TORCH_CHECK(!component_major ||
+                  key_value.numel() >= component_lmc_plane_offset,
+              "key_value storage is too small for component-major layout");
 
   TORCH_CHECK(key_value_ptrs.device().is_cpu(),
               "key_value_ptrs must be a CPU tensor for acl batch transfer");
@@ -201,6 +238,7 @@ AclBatchMemcpyPlan prepare_multi_layer_kv_transfer_acl_batch(
   plan.srcs.reserve(num_copies);
   plan.dest_maxs.reserve(num_copies);
   plan.sizes.reserve(num_copies);
+  plan.ops.reserve(num_copies);
 
   for (int64_t cache_idx = 0; cache_idx < kv_size; ++cache_idx) {
     for (int64_t layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
@@ -209,8 +247,8 @@ AclBatchMemcpyPlan prepare_multi_layer_kv_transfer_acl_batch(
           component_hidden_dims[cache_idx];
       const int64_t lmc_cache_idx = lmc_kv_size == 1 ? 0 : cache_idx;
       const int64_t lmc_hidden_offset = component_lmc_hidden_offsets[cache_idx];
-      const bool can_coalesce_tokens =
-          lmc_token_stride == component_hidden_dims_value;
+      const bool component_rows_contiguous_in_lmc =
+          component_major || lmc_token_stride == component_hidden_dims_value;
 
       int64_t paged_cache_offset_elements = 0;
       if (kvcache_format == kvcache_ops::KVCacheFormat::SEPARATE_KV ||
@@ -234,19 +272,24 @@ AclBatchMemcpyPlan prepare_multi_layer_kv_transfer_acl_batch(
                     ", page_buffer_size=", page_buffer_size);
 
         int64_t run_tokens = 1;
-        if (can_coalesce_tokens) {
-          while (token_idx + run_tokens < num_tokens &&
-                 slot + run_tokens < page_buffer_size &&
-                 slots[token_idx + run_tokens] == slot + run_tokens) {
-            ++run_tokens;
-          }
+        while (token_idx + run_tokens < num_tokens &&
+               slot + run_tokens < page_buffer_size &&
+               slots[token_idx + run_tokens] == slot + run_tokens) {
+          ++run_tokens;
         }
 
-        uint8_t *lmc_ptr =
-            lmc_base +
-            (lmc_cache_idx * lmc_kv_stride + layer_idx * lmc_layer_stride +
-             token_idx * lmc_token_stride + lmc_hidden_offset) *
-                element_size;
+        int64_t lmc_offset_elements = 0;
+        if (component_major) {
+          lmc_offset_elements =
+              component_lmc_plane_offsets[cache_idx] +
+              layer_idx * num_tokens * component_hidden_dims_value +
+              token_idx * component_hidden_dims_value;
+        } else {
+          lmc_offset_elements =
+              lmc_cache_idx * lmc_kv_stride + layer_idx * lmc_layer_stride +
+              token_idx * lmc_token_stride + lmc_hidden_offset;
+        }
+        uint8_t *lmc_ptr = lmc_base + lmc_offset_elements * element_size;
         int64_t paged_offset_elements =
             paged_cache_offset_elements + slot * component_hidden_dims_value;
         uint8_t *paged_ptr = reinterpret_cast<uint8_t *>(
@@ -254,15 +297,43 @@ AclBatchMemcpyPlan prepare_multi_layer_kv_transfer_acl_batch(
         const size_t run_copy_bytes = static_cast<size_t>(
             run_tokens * component_hidden_dims_value * element_size);
 
-        if (direction) {
-          plan.dsts.push_back(lmc_ptr);
-          plan.srcs.push_back(paged_ptr);
-        } else {
-          plan.dsts.push_back(paged_ptr);
-          plan.srcs.push_back(lmc_ptr);
+        const bool is_single_token_run = run_tokens == 1;
+        const bool use_1d_copy =
+            is_single_token_run || component_rows_contiguous_in_lmc;
+        const bool use_2d_strided_copy = !use_1d_copy;
+
+        if (use_1d_copy) {
+          if (direction) {
+            plan.dsts.push_back(lmc_ptr);
+            plan.srcs.push_back(paged_ptr);
+          } else {
+            plan.dsts.push_back(paged_ptr);
+            plan.srcs.push_back(lmc_ptr);
+          }
+          plan.dest_maxs.push_back(run_copy_bytes);
+          plan.sizes.push_back(run_copy_bytes);
+          plan.ops.push_back({AclMemcpyOpKind::Copy1D, plan.sizes.size() - 1});
+        } else if (use_2d_strided_copy) {
+          // Packed MLA/DSA stores each component inside a wider token row:
+          // copy one component-width row per token with the full LMCache token
+          // stride as the 2D pitch.
+          const size_t component_bytes =
+              static_cast<size_t>(component_hidden_dims_value * element_size);
+          const size_t paged_pitch_bytes = component_bytes;
+          const size_t lmc_pitch_bytes =
+              static_cast<size_t>(lmc_token_stride * element_size);
+          if (direction) {
+            plan.copies_2d.push_back({lmc_ptr, paged_ptr, lmc_pitch_bytes,
+                                      paged_pitch_bytes, component_bytes,
+                                      static_cast<size_t>(run_tokens)});
+          } else {
+            plan.copies_2d.push_back({paged_ptr, lmc_ptr, paged_pitch_bytes,
+                                      lmc_pitch_bytes, component_bytes,
+                                      static_cast<size_t>(run_tokens)});
+          }
+          plan.ops.push_back(
+              {AclMemcpyOpKind::Copy2D, plan.copies_2d.size() - 1});
         }
-        plan.dest_maxs.push_back(run_copy_bytes);
-        plan.sizes.push_back(run_copy_bytes);
         token_idx += run_tokens;
       }
     }
@@ -282,10 +353,51 @@ aclrtMemcpyBatchAttr make_acl_batch_attr(const bool direction,
   return attr;
 }
 
+aclrtMemcpyKind make_acl_memcpy_kind(const bool direction) {
+  return direction ? ACL_MEMCPY_DEVICE_TO_HOST : ACL_MEMCPY_HOST_TO_DEVICE;
+}
+
+void run_acl_batch_copy_span(AclBatchMemcpyPlan &plan, const size_t begin,
+                             const size_t count, const bool direction,
+                             const int32_t device_id) {
+  if (count == 0) {
+    return;
+  }
+
+  aclrtMemcpyBatchAttr attr = make_acl_batch_attr(direction, device_id);
+  size_t attr_index = 0;
+  size_t fail_index = 0;
+  aclError ret =
+      aclrtMemcpyBatch(plan.dsts.data() + begin, plan.dest_maxs.data() + begin,
+                       plan.srcs.data() + begin, plan.sizes.data() + begin,
+                       count, &attr, &attr_index, 1, &fail_index);
+  TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtMemcpyBatch failed: ret=", ret,
+              ", fail_index=", fail_index);
+}
+
+void run_acl_batch_copy_span_async(AclBatchMemcpyPlan &plan, const size_t begin,
+                                   const size_t count, const bool direction,
+                                   const int32_t device_id,
+                                   aclrtStream stream) {
+  if (count == 0) {
+    return;
+  }
+
+  aclrtMemcpyBatchAttr attr = make_acl_batch_attr(direction, device_id);
+  size_t attr_index = 0;
+  size_t fail_index = 0;
+  aclError ret = aclrtMemcpyBatchAsync(
+      plan.dsts.data() + begin, plan.dest_maxs.data() + begin,
+      plan.srcs.data() + begin, plan.sizes.data() + begin, count, &attr,
+      &attr_index, 1, &fail_index, stream);
+  TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtMemcpyBatchAsync failed: ret=", ret,
+              ", fail_index=", fail_index);
+}
+
 void run_multi_layer_kv_transfer_acl_batch(
     AclBatchMemcpyPlan plan, const torch::Device &paged_memory_device,
     const bool direction, const bool use_sync) {
-  if (plan.sizes.empty()) {
+  if (plan.ops.empty()) {
     return;
   }
 
@@ -297,16 +409,31 @@ void run_multi_layer_kv_transfer_acl_batch(
   const auto npuStream = c10_npu::getCurrentNPUStream();
   if (use_sync) {
     npuStream.synchronize();
-    aclrtMemcpyBatchAttr attr = make_acl_batch_attr(direction, device_id);
-    size_t attr_index = 0;
-    size_t fail_index = 0;
+    const aclrtMemcpyKind kind = make_acl_memcpy_kind(direction);
+    size_t batch_begin = 0;
+    size_t batch_count = 0;
+    for (const AclMemcpyOp &op : plan.ops) {
+      if (op.kind == AclMemcpyOpKind::Copy1D) {
+        if (batch_count == 0) {
+          batch_begin = op.index;
+        }
+        TORCH_CHECK(op.index == batch_begin + batch_count,
+                    "Non-contiguous 1D ACL copy span");
+        ++batch_count;
+        continue;
+      }
 
-    aclError ret =
-        aclrtMemcpyBatch(plan.dsts.data(), plan.dest_maxs.data(),
-                         plan.srcs.data(), plan.sizes.data(), plan.sizes.size(),
-                         &attr, &attr_index, 1, &fail_index);
-    TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtMemcpyBatch failed: ret=", ret,
-                ", fail_index=", fail_index);
+      run_acl_batch_copy_span(plan, batch_begin, batch_count, direction,
+                              device_id);
+      batch_count = 0;
+      const Acl2DMemcpyEntry &copy = plan.copies_2d[op.index];
+      aclError ret = aclrtMemcpy2d(copy.dst, copy.dpitch, copy.src, copy.spitch,
+                                   copy.width, copy.height, kind);
+      TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtMemcpy2d failed: ret=", ret,
+                  ", index=", op.index);
+    }
+    run_acl_batch_copy_span(plan, batch_begin, batch_count, direction,
+                            device_id);
     return;
   }
 
@@ -314,21 +441,36 @@ void run_multi_layer_kv_transfer_acl_batch(
 
   at_npu::native::OpCommand cmd;
   cmd.Name("multi_layer_kv_transfer_acl_batch");
-  cmd.SetCustomHandler(
-      [plan = std::move(plan), stream, direction, device_id]() mutable -> int {
-        aclrtMemcpyBatchAttr attr = make_acl_batch_attr(direction, device_id);
-        size_t attr_index = 0;
-        size_t fail_index = 0;
+  cmd.SetCustomHandler([plan = std::move(plan), stream, direction,
+                        device_id]() mutable -> int {
+    const aclrtMemcpyKind kind = make_acl_memcpy_kind(direction);
+    size_t batch_begin = 0;
+    size_t batch_count = 0;
+    for (const AclMemcpyOp &op : plan.ops) {
+      if (op.kind == AclMemcpyOpKind::Copy1D) {
+        if (batch_count == 0) {
+          batch_begin = op.index;
+        }
+        TORCH_CHECK(op.index == batch_begin + batch_count,
+                    "Non-contiguous 1D ACL copy span");
+        ++batch_count;
+        continue;
+      }
 
-        aclError ret = aclrtMemcpyBatchAsync(
-            plan.dsts.data(), plan.dest_maxs.data(), plan.srcs.data(),
-            plan.sizes.data(), plan.sizes.size(), &attr, &attr_index, 1,
-            &fail_index, stream);
-        TORCH_CHECK(ret == ACL_ERROR_NONE,
-                    "aclrtMemcpyBatchAsync failed: ret=", ret,
-                    ", fail_index=", fail_index);
-        return 0;
-      });
+      run_acl_batch_copy_span_async(plan, batch_begin, batch_count, direction,
+                                    device_id, stream);
+      batch_count = 0;
+      const Acl2DMemcpyEntry &copy = plan.copies_2d[op.index];
+      aclError ret =
+          aclrtMemcpy2dAsync(copy.dst, copy.dpitch, copy.src, copy.spitch,
+                             copy.width, copy.height, kind, stream);
+      TORCH_CHECK(ret == ACL_ERROR_NONE, "aclrtMemcpy2dAsync failed: ret=", ret,
+                  ", index=", op.index);
+    }
+    run_acl_batch_copy_span_async(plan, batch_begin, batch_count, direction,
+                                  device_id, stream);
+    return 0;
+  });
   cmd.Run();
 }
 } // namespace
@@ -365,6 +507,22 @@ void multi_layer_kv_transfer_acl_batch_sync(
       dsa_hidden_dims);
   run_multi_layer_kv_transfer_acl_batch(std::move(plan), paged_memory_device,
                                         direction, true);
+}
+
+void multi_layer_kv_transfer_acl_batch_component_major(
+    torch::Tensor &key_value, // flat component-major storage
+    const torch::Tensor &key_value_ptrs,
+    const torch::Tensor &slot_mapping, // CPU [num_tokens]
+    const torch::Device &paged_memory_device, const int page_buffer_size,
+    const bool direction, const bool use_mla, const int kvcache_format_raw,
+    const int64_t k_hidden_dims, const int64_t v_hidden_dims,
+    const int64_t dsa_hidden_dims) {
+  AclBatchMemcpyPlan plan = prepare_multi_layer_kv_transfer_acl_batch(
+      key_value, key_value_ptrs, slot_mapping, page_buffer_size, direction,
+      use_mla, kvcache_format_raw, k_hidden_dims, v_hidden_dims,
+      dsa_hidden_dims, true);
+  run_multi_layer_kv_transfer_acl_batch(std::move(plan), paged_memory_device,
+                                        direction, false);
 }
 
 void fused_multi_layer_kv_transfer(

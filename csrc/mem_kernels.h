@@ -93,6 +93,13 @@ void multi_layer_kv_transfer_acl_batch_sync(
     const int64_t k_hidden_dims = 0, const int64_t v_hidden_dims = 0,
     const int64_t dsa_hidden_dims = 0);
 
+void multi_layer_kv_transfer_acl_batch_component_major(
+    torch::Tensor &key_value, const torch::Tensor &key_value_ptrs,
+    const torch::Tensor &slot_mapping, const torch::Device &paged_memory_device,
+    const int page_buffer_size, const bool direction, const bool use_mla,
+    const int kvcache_format_raw, const int64_t k_hidden_dims = 0,
+    const int64_t v_hidden_dims = 0, const int64_t dsa_hidden_dims = 0);
+
 void fused_multi_layer_kv_transfer(
     torch::Tensor &key_value,
     torch::Tensor &staging_cache, // staging buffer

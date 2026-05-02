@@ -445,6 +445,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         self.use_acl_batch_memcpy_sync: bool = kwargs.get(
             "use_acl_batch_memcpy_sync", False
         )
+        self.use_dsa_component_major_acl: bool = kwargs.get(
+            "use_dsa_component_major_acl", self.use_acl_batch
+        )
         if self.use_acl_batch:
             if self.use_acl_batch_memcpy_sync:
                 self.transfer_func = lmc_ops.multi_layer_kv_transfer_acl_batch_sync
@@ -472,6 +475,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         layout_hints: Optional[LayoutHints] = None,
         use_acl_batch: bool = False,
         use_acl_batch_memcpy_sync: bool = False,
+        use_dsa_component_major_acl: Optional[bool] = None,
     ) -> "VLLMPagedMemGPUConnectorV2":
         """Create a connector from LMCacheMetadata.
 
@@ -508,6 +512,11 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             layout_hints=layout_hints,
             use_acl_batch=use_acl_batch,
             use_acl_batch_memcpy_sync=use_acl_batch_memcpy_sync,
+            use_dsa_component_major_acl=(
+                use_acl_batch
+                if use_dsa_component_major_acl is None
+                else use_dsa_component_major_acl
+            ),
         )
 
     def _initialize_pointers(self, kv_caches: List[torch.Tensor]) -> torch.Tensor:
@@ -663,10 +672,10 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     "in order to be processed by VLLMPagedMemNPUConnector."
                 )
 
-        if "slot_mapping" not in kwargs:
-            raise ValueError("'slot_mapping' should be provided in kwargs.")
+        if "slot_mapping_npu" not in kwargs:
+            raise ValueError("'slot_mapping_npu' should be provided in kwargs.")
 
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        slot_mapping: torch.Tensor = kwargs["slot_mapping_npu"]
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
@@ -746,6 +755,36 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
+    def _use_dsa_component_major_acl(self) -> bool:
+        return (
+            self.kv_format == KVCacheFormat.DSA_KV
+            and self.use_acl_batch
+            and self.use_dsa_component_major_acl
+        )
+
+    def _dsa_component_major_transfer(
+        self,
+        memory_obj: MemoryObj,
+        slot_mapping_cpu: torch.Tensor,
+        start: int,
+        end: int,
+        direction: bool,
+    ) -> None:
+        assert self.kv_cache_pointers is not None
+        lmc_ops.multi_layer_kv_transfer_acl_batch_component_major(
+            memory_obj.tensor,
+            self.kv_cache_pointers,
+            slot_mapping_cpu[start:end],
+            self.kvcaches_device,
+            self.page_buffer_size,
+            direction,
+            self.use_mla,
+            self.kv_format.value,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self.dsa_head_dim,
+        )
+
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
         The kvcaches should correspond to the "WHOLE token sequence".
@@ -771,7 +810,21 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
-        if self.use_mla:
+        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+
+        if self.kv_format == KVCacheFormat.DSA_KV:
+            valid_formats = (
+                MemoryFormat.KV_2LTD,
+                MemoryFormat.KV_MLA_FMT,
+                MemoryFormat.KV_DSA_COMPONENT_MAJOR,
+            )
+            if memory_obj.metadata.fmt not in valid_formats:
+                raise ValueError(
+                    "The DSA memory object should be in KV_2LTD, KV_MLA_FMT, "
+                    "or KV_DSA_COMPONENT_MAJOR format in order to be processed "
+                    "by VLLMPagedMemNPUConnector."
+                )
+        elif self.use_mla:
             if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
                 raise ValueError(
                     "The memory object should be in KV_MLA_FMT format in"
@@ -783,18 +836,35 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     "The memory object should be in KV_2LTD format in "
                     " order to be processed by VLLMPagedMemNPUConnector."
                 )
+        if "slot_mapping_cpu" not in kwargs:
+            raise ValueError("'slot_mapping_cpu' should be provided in kwargs.")
+        if "slot_mapping_npu" not in kwargs:
+            raise ValueError("'slot_mapping_npu' should be provided in kwargs.")
 
-        if "slot_mapping" not in kwargs:
-            raise ValueError("'slot_mapping' should be provided in kwargs.")
+        slot_mapping_cpu: torch.Tensor = kwargs["slot_mapping_cpu"]
+        slot_mapping_npu: torch.Tensor = kwargs["slot_mapping_npu"]
 
-        slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+        if (
+            self.kv_format == KVCacheFormat.DSA_KV
+            and memory_obj.metadata.fmt == MemoryFormat.KV_DSA_COMPONENT_MAJOR
+        ):
+            assert slot_mapping_cpu is not None
+            self._dsa_component_major_transfer(
+                memory_obj, slot_mapping_cpu, start, end, False
+            )
+            return
 
-        kv_cache_pointers = self._initialize_pointers(self.kvcaches)
-
-        lmc_ops.multi_layer_kv_transfer(
+        transfer_ptrs = (
+            self.kv_cache_pointers if self.use_acl_batch else kv_cache_pointers
+        )
+        assert transfer_ptrs is not None
+        transfer_slot_mapping = (
+            slot_mapping_cpu if self.use_acl_batch else slot_mapping_npu
+        )
+        self.transfer_func(
             memory_obj.tensor,
-            kv_cache_pointers,
-            slot_mapping[start:end],
+            transfer_ptrs,
+            transfer_slot_mapping[start:end],
             self.kvcaches_device,
             self.page_buffer_size,
             False,
@@ -843,14 +913,17 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
 
         slot_mapping_cpu: torch.Tensor = kwargs["slot_mapping"]
         slot_mapping_npu: torch.Tensor = kwargs.get("slot_mapping_npu")
-        if not self.use_acl_batch:
+        if not self.use_acl_batch and not self._use_dsa_component_major_acl():
             assert slot_mapping_npu is not None, (
                 "slot_mapping_npu should be provided in kwargs."
             )
 
         with torch.cuda.stream(self.store_stream):
-            # No staging buffer or token count mismatch
-            if self.use_acl_batch:
+            if self._use_dsa_component_major_acl():
+                self._dsa_component_major_transfer(
+                    memory_obj, slot_mapping_cpu, start, end, True
+                )
+            elif self.use_acl_batch:
                 self.transfer_func(
                     memory_obj.tensor,
                     self.kv_cache_pointers,
@@ -865,6 +938,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     self.dsa_head_dim,
                 )
             elif self.gpu_buffer is None or end - start != self.gpu_buffer.shape[2]:
+                assert slot_mapping_npu is not None
                 self.transfer_func(
                     memory_obj.tensor,
                     kv_cache_pointers,
@@ -879,6 +953,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     self.dsa_head_dim,
                 )
             else:
+                assert slot_mapping_npu is not None
                 assert self.gpu_buffer.device == self.kvcaches_device
                 tmp_gpu_buffer = self.gpu_buffer[:, :, : end - start, :]
                 lmc_ops.fused_multi_layer_kv_transfer(
@@ -902,7 +977,9 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             # memory object
             self.store_stream.synchronize()
 
-        if self.use_mla:
+        if self._use_dsa_component_major_acl():
+            memory_obj.metadata.fmt = MemoryFormat.KV_DSA_COMPONENT_MAJOR
+        elif self.use_mla or self.kv_format == KVCacheFormat.MLA_KV:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):

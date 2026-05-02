@@ -1205,6 +1205,161 @@ def test_batched_fused_single_layer_kernel_separate_kv(
         torch.npu.empty_cache()
 
 
+def _make_acl_batch_merged_cache_pointers(kv_cache):
+    kv_cache_pointers = torch.empty(
+        len(kv_cache), dtype=torch.int64, device="cpu", pin_memory=True
+    )
+    for layer_id, cache in enumerate(kv_cache):
+        kv_cache_pointers[layer_id] = cache.data_ptr()
+    return kv_cache_pointers
+
+
+def _assert_acl_batch_merged_cpu_buffer_matches_cache(
+    cpu_tensor, kv_cache, slot_mapping_cpu, hidden_dim
+):
+    slot_mapping_device = slot_mapping_cpu.to(
+        device=kv_cache[0].device, dtype=torch.long
+    )
+    for layer_id, layer_cache in enumerate(kv_cache):
+        for cache_id in range(2):
+            expected = (
+                layer_cache[cache_id].reshape(-1, hidden_dim)[slot_mapping_device].cpu()
+            )
+            actual = cpu_tensor[
+                cache_id, layer_id, : slot_mapping_cpu.numel(), :hidden_dim
+            ]
+            assert torch.equal(actual, expected), (
+                f"ACL batch merged mismatch at layer={layer_id}, cache={cache_id}"
+            )
+
+
+def _run_acl_batch_merged_format_roundtrip(
+    kv_cache_src,
+    kv_cache_dst,
+    slot_mapping_cpu,
+    page_buffer_size,
+    hidden_dim,
+    num_heads,
+    head_size,
+    mem_allocator,
+    transfer_func_name,
+):
+    num_layers = len(kv_cache_src)
+    dtype = kv_cache_src[0].dtype
+    mem_obj_shape = torch.Size([2, num_layers, slot_mapping_cpu.numel(), hidden_dim])
+    memory_obj = mem_allocator.allocate(mem_obj_shape, dtype)
+    transfer_func = getattr(lmc_ops, transfer_func_name)
+
+    kv_cache_pointers_src = _make_acl_batch_merged_cache_pointers(kv_cache_src)
+    transfer_func(
+        memory_obj.tensor,
+        kv_cache_pointers_src,
+        slot_mapping_cpu,
+        kv_cache_src[0].device,
+        page_buffer_size,
+        True,  # from_gpu
+        False,  # use_mla
+        1,  # MERGED_KV
+        hidden_dim,
+        hidden_dim,
+        0,
+    )
+    torch.npu.synchronize()
+
+    _assert_acl_batch_merged_cpu_buffer_matches_cache(
+        memory_obj.tensor, kv_cache_src, slot_mapping_cpu, hidden_dim
+    )
+
+    kv_cache_pointers_dst = _make_acl_batch_merged_cache_pointers(kv_cache_dst)
+    transfer_func(
+        memory_obj.tensor,
+        kv_cache_pointers_dst,
+        slot_mapping_cpu,
+        kv_cache_dst[0].device,
+        page_buffer_size,
+        False,  # to_gpu
+        False,  # use_mla
+        1,  # MERGED_KV
+        hidden_dim,
+        hidden_dim,
+        0,
+    )
+    torch.npu.synchronize()
+
+    check_paged_kv_cache_equal(
+        kv_cache_src,
+        kv_cache_dst,
+        slot_mapping_cpu.to(device=kv_cache_dst[0].device, dtype=torch.long),
+        num_heads=num_heads,
+        head_size=head_size,
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [17, 128])
+@pytest.mark.parametrize("num_layers", [1, 4])
+@pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize(
+    "transfer_func_name",
+    ["multi_layer_kv_transfer_acl_batch", "multi_layer_kv_transfer_acl_batch_sync"],
+)
+def test_multi_layer_kv_transfer_acl_batch_merged_format(
+    num_tokens,
+    num_layers,
+    slot_dtype,
+    transfer_func_name,
+):
+    device = "npu"
+    num_blocks = 64
+    block_size = 16
+    num_heads = 1
+    head_size = 128
+    dtype = torch.bfloat16
+    hidden_dim = num_heads * head_size
+    page_buffer_size = num_blocks * block_size
+
+    kv_cache_src = generate_kv_cache_paged_list_tensors(
+        num_blocks=num_blocks,
+        device=device,
+        block_size=block_size,
+        dtype=dtype,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        head_size=head_size,
+    )
+    kv_cache_dst = generate_kv_cache_paged_list_tensors(
+        num_blocks=num_blocks,
+        device=device,
+        block_size=block_size,
+        dtype=dtype,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        head_size=head_size,
+    )
+    slot_mapping_cpu = torch.tensor(
+        random.sample(range(0, page_buffer_size), num_tokens),
+        dtype=slot_dtype,
+        device="cpu",
+    )
+
+    total_elements = 2 * num_layers * num_tokens * hidden_dim
+    mem_allocator = PinMemoryAllocator(total_elements * dtype.itemsize * 2)
+    try:
+        _run_acl_batch_merged_format_roundtrip(
+            kv_cache_src,
+            kv_cache_dst,
+            slot_mapping_cpu,
+            page_buffer_size,
+            hidden_dim,
+            num_heads,
+            head_size,
+            mem_allocator,
+            transfer_func_name,
+        )
+    finally:
+        mem_allocator.close()
+        torch.npu.empty_cache()
+
+
 def _make_acl_batch_tuple_cache_pointers(kv_cache):
     kv_size = len(kv_cache[0])
     kv_cache_pointers = torch.empty(
@@ -1233,6 +1388,33 @@ def _assert_acl_batch_cpu_buffer_matches_cache(
         assert torch.equal(actual, expected), f"ACL batch mismatch at layer={layer_id}"
 
 
+def _assert_component_major_cpu_buffer_matches_cache(
+    cpu_tensor, kv_cache, slot_mapping_cpu, hidden_dims
+):
+    slot_mapping_device = slot_mapping_cpu.to(
+        device=kv_cache[0][0].device, dtype=torch.long
+    )
+    num_layers = len(kv_cache)
+    num_tokens = slot_mapping_cpu.numel()
+    flat_cpu_tensor = cpu_tensor.reshape(-1)
+
+    component_plane_offset = 0
+    for cache_id, hidden_dim in enumerate(hidden_dims):
+        for layer_id, layer_cache in enumerate(kv_cache):
+            expected = (
+                layer_cache[cache_id].reshape(-1, hidden_dim)[slot_mapping_device].cpu()
+            )
+            layer_offset = component_plane_offset + layer_id * num_tokens * hidden_dim
+            actual = flat_cpu_tensor[
+                layer_offset : layer_offset + num_tokens * hidden_dim
+            ].reshape(num_tokens, hidden_dim)
+            assert torch.equal(actual, expected), (
+                "Component-major ACL batch mismatch at "
+                f"layer={layer_id}, cache={cache_id}"
+            )
+        component_plane_offset += num_layers * num_tokens * hidden_dim
+
+
 def _run_acl_batch_tuple_format_roundtrip(
     kv_cache_src,
     kv_cache_dst,
@@ -1241,6 +1423,8 @@ def _run_acl_batch_tuple_format_roundtrip(
     hidden_dims,
     kvcache_format,
     mem_allocator,
+    timing_label=None,
+    timing_bytes=None,
 ):
     num_layers = len(kv_cache_src)
     total_hidden_dims = sum(hidden_dims)
@@ -1251,6 +1435,10 @@ def _run_acl_batch_tuple_format_roundtrip(
     memory_obj = mem_allocator.allocate(mem_obj_shape, dtype)
 
     kv_cache_pointers_src = _make_acl_batch_tuple_cache_pointers(kv_cache_src)
+    if timing_label is not None:
+        from_start_event = torch.npu.Event(enable_timing=True)
+        from_end_event = torch.npu.Event(enable_timing=True)
+        from_start_event.record()
     lmc_ops.multi_layer_kv_transfer_acl_batch(
         memory_obj.tensor,
         kv_cache_pointers_src,
@@ -1264,13 +1452,29 @@ def _run_acl_batch_tuple_format_roundtrip(
         hidden_dims[1],
         hidden_dims[2] if len(hidden_dims) == 3 else 0,
     )
+    if timing_label is not None:
+        from_end_event.record()
     torch.npu.synchronize()
+    if timing_label is not None:
+        from_gpu_time_ms = from_start_event.elapsed_time(from_end_event)
+        if timing_bytes is None:
+            print(f"\n[{timing_label}] ACL batch from_gpu: {from_gpu_time_ms:.6f} ms")
+        else:
+            from_gpu_gib_s = timing_bytes / (from_gpu_time_ms / 1000) / (1024**3)
+            print(
+                f"\n[{timing_label}] ACL batch from_gpu: "
+                f"{from_gpu_time_ms:.6f} ms, {from_gpu_gib_s:.3f} GiB/s"
+            )
 
     _assert_acl_batch_cpu_buffer_matches_cache(
         memory_obj.tensor, kv_cache_src, slot_mapping_cpu, hidden_dims
     )
 
     kv_cache_pointers_dst = _make_acl_batch_tuple_cache_pointers(kv_cache_dst)
+    if timing_label is not None:
+        to_start_event = torch.npu.Event(enable_timing=True)
+        to_end_event = torch.npu.Event(enable_timing=True)
+        to_start_event.record()
     lmc_ops.multi_layer_kv_transfer_acl_batch(
         memory_obj.tensor,
         kv_cache_pointers_dst,
@@ -1284,7 +1488,188 @@ def _run_acl_batch_tuple_format_roundtrip(
         hidden_dims[1],
         hidden_dims[2] if len(hidden_dims) == 3 else 0,
     )
+    if timing_label is not None:
+        to_end_event.record()
     torch.npu.synchronize()
+    if timing_label is not None:
+        to_gpu_time_ms = to_start_event.elapsed_time(to_end_event)
+        if timing_bytes is None:
+            print(f"[{timing_label}] ACL batch to_gpu: {to_gpu_time_ms:.6f} ms")
+        else:
+            to_gpu_gib_s = timing_bytes / (to_gpu_time_ms / 1000) / (1024**3)
+            print(
+                f"[{timing_label}] ACL batch to_gpu: "
+                f"{to_gpu_time_ms:.6f} ms, {to_gpu_gib_s:.3f} GiB/s"
+            )
+
+    return memory_obj
+
+
+def _run_acl_batch_component_major_roundtrip(
+    kv_cache_src,
+    kv_cache_dst,
+    slot_mapping_cpu,
+    page_buffer_size,
+    hidden_dims,
+    mem_allocator,
+    timing_label,
+    timing_bytes,
+):
+    num_layers = len(kv_cache_src)
+    total_hidden_dims = sum(hidden_dims)
+    dtype = kv_cache_src[0][0].dtype
+    mem_obj_shape = torch.Size(
+        [1, num_layers, slot_mapping_cpu.numel(), total_hidden_dims]
+    )
+    memory_obj = mem_allocator.allocate(mem_obj_shape, dtype)
+
+    kv_cache_pointers_src = _make_acl_batch_tuple_cache_pointers(kv_cache_src)
+    start_event = torch.npu.Event(enable_timing=True)
+    end_event = torch.npu.Event(enable_timing=True)
+    start_event.record()
+    lmc_ops.multi_layer_kv_transfer_acl_batch_component_major(
+        memory_obj.tensor,
+        kv_cache_pointers_src,
+        slot_mapping_cpu,
+        kv_cache_src[0][0].device,
+        page_buffer_size,
+        True,  # from_gpu
+        True,  # use_mla
+        4,  # DSA_KV
+        hidden_dims[0],
+        hidden_dims[1],
+        hidden_dims[2],
+    )
+    end_event.record()
+    torch.npu.synchronize()
+    from_gpu_time_ms = start_event.elapsed_time(end_event)
+    _print_transfer_timing(
+        timing_label,
+        "ACL component-major",
+        "from_gpu",
+        from_gpu_time_ms,
+        timing_bytes,
+    )
+
+    _assert_component_major_cpu_buffer_matches_cache(
+        memory_obj.tensor, kv_cache_src, slot_mapping_cpu, hidden_dims
+    )
+
+    kv_cache_pointers_dst = _make_acl_batch_tuple_cache_pointers(kv_cache_dst)
+    start_event = torch.npu.Event(enable_timing=True)
+    end_event = torch.npu.Event(enable_timing=True)
+    start_event.record()
+    lmc_ops.multi_layer_kv_transfer_acl_batch_component_major(
+        memory_obj.tensor,
+        kv_cache_pointers_dst,
+        slot_mapping_cpu,
+        kv_cache_dst[0][0].device,
+        page_buffer_size,
+        False,  # to_gpu
+        True,  # use_mla
+        4,  # DSA_KV
+        hidden_dims[0],
+        hidden_dims[1],
+        hidden_dims[2],
+    )
+    end_event.record()
+    torch.npu.synchronize()
+    to_gpu_time_ms = start_event.elapsed_time(end_event)
+    _print_transfer_timing(
+        timing_label,
+        "ACL component-major",
+        "to_gpu",
+        to_gpu_time_ms,
+        timing_bytes,
+    )
+
+    return memory_obj
+
+
+def _print_transfer_timing(
+    timing_label, transfer_name, phase, elapsed_ms, timing_bytes
+):
+    gib_s = timing_bytes / (elapsed_ms / 1000) / (1024**3)
+    print(
+        f"[{timing_label}] {transfer_name} {phase}: "
+        f"{elapsed_ms:.6f} ms, {gib_s:.3f} GiB/s"
+    )
+
+
+def _run_multi_layer_dsa_kernel_roundtrip(
+    kv_cache_src,
+    kv_cache_dst,
+    slot_mapping_cpu,
+    page_buffer_size,
+    hidden_dims,
+    mem_allocator,
+    timing_label,
+    timing_bytes,
+):
+    num_layers = len(kv_cache_src)
+    total_hidden_dims = sum(hidden_dims)
+    dtype = kv_cache_src[0][0].dtype
+    mem_obj_shape = torch.Size(
+        [1, num_layers, slot_mapping_cpu.numel(), total_hidden_dims]
+    )
+    memory_obj = mem_allocator.allocate(mem_obj_shape, dtype)
+    slot_mapping_npu = slot_mapping_cpu.to(device=kv_cache_src[0][0].device)
+
+    kv_cache_pointers_src = _make_acl_batch_tuple_cache_pointers(kv_cache_src).npu()
+    start_event = torch.npu.Event(enable_timing=True)
+    end_event = torch.npu.Event(enable_timing=True)
+    start_event.record()
+    lmc_ops.multi_layer_kv_transfer(
+        memory_obj.tensor,
+        kv_cache_pointers_src,
+        slot_mapping_npu,
+        kv_cache_src[0][0].device,
+        page_buffer_size,
+        True,  # from_gpu
+        False,
+        4,  # DSA_KV
+        hidden_dims[0],
+        hidden_dims[1],
+        hidden_dims[2],
+    )
+    end_event.record()
+    torch.npu.synchronize()
+    from_gpu_time_ms = start_event.elapsed_time(end_event)
+    _print_transfer_timing(
+        timing_label,
+        "multi_layer_kernel",
+        "from_gpu",
+        from_gpu_time_ms,
+        timing_bytes,
+    )
+
+    kv_cache_pointers_dst = _make_acl_batch_tuple_cache_pointers(kv_cache_dst).npu()
+    start_event = torch.npu.Event(enable_timing=True)
+    end_event = torch.npu.Event(enable_timing=True)
+    start_event.record()
+    lmc_ops.multi_layer_kv_transfer(
+        memory_obj.tensor,
+        kv_cache_pointers_dst,
+        slot_mapping_npu,
+        kv_cache_dst[0][0].device,
+        page_buffer_size,
+        False,  # to_gpu
+        False,
+        4,  # DSA_KV
+        hidden_dims[0],
+        hidden_dims[1],
+        hidden_dims[2],
+    )
+    end_event.record()
+    torch.npu.synchronize()
+    to_gpu_time_ms = start_event.elapsed_time(end_event)
+    _print_transfer_timing(
+        timing_label,
+        "multi_layer_kernel",
+        "to_gpu",
+        to_gpu_time_ms,
+        timing_bytes,
+    )
 
     return memory_obj
 
@@ -1362,10 +1747,12 @@ def test_multi_layer_kv_transfer_acl_batch_mla_format(
 @pytest.mark.parametrize("num_tokens", [17, 128])
 @pytest.mark.parametrize("num_layers", [1, 4])
 @pytest.mark.parametrize("slot_dtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize("slot_pattern", ["random", "consecutive"])
 def test_multi_layer_kv_transfer_acl_batch_dsa_format(
     num_tokens,
     num_layers,
     slot_dtype,
+    slot_pattern,
 ):
     device = "npu"
     num_blocks = 64
@@ -1399,11 +1786,19 @@ def test_multi_layer_kv_transfer_acl_batch_dsa_format(
         block_size=block_size,
         dtype=dtype,
     )
-    slot_mapping_cpu = torch.tensor(
-        random.sample(range(0, page_buffer_size), num_tokens),
-        dtype=slot_dtype,
-        device="cpu",
-    )
+    if slot_pattern == "consecutive":
+        slot_mapping_cpu = torch.arange(
+            3,
+            3 + num_tokens,
+            dtype=slot_dtype,
+            device="cpu",
+        )
+    else:
+        slot_mapping_cpu = torch.tensor(
+            random.sample(range(0, page_buffer_size), num_tokens),
+            dtype=slot_dtype,
+            device="cpu",
+        )
 
     total_hidden_dims = kv_lora_rank + qk_rope_head_dim + dsa_head_dim
     total_elements = num_layers * num_tokens * total_hidden_dims
@@ -1417,6 +1812,11 @@ def test_multi_layer_kv_transfer_acl_batch_dsa_format(
             [kv_lora_rank, qk_rope_head_dim, dsa_head_dim],
             4,  # DSA_KV
             mem_allocator,
+            timing_label=(
+                f"DSA {slot_pattern}, layers={num_layers}, tokens={num_tokens}, "
+                f"slot_dtype={slot_dtype}"
+            ),
+            timing_bytes=total_elements * dtype.itemsize,
         )
         check_paged_kv_cache_equal(
             kv_cache_src,
@@ -1430,6 +1830,170 @@ def test_multi_layer_kv_transfer_acl_batch_dsa_format(
             dsa_head_dim=dsa_head_dim,
         )
     finally:
+        mem_allocator.close()
+        torch.npu.empty_cache()
+
+
+@pytest.mark.parametrize("num_tokens", [128, 512, 1024, 2048, 4192])
+@pytest.mark.parametrize("slot_pattern", ["random", "consecutive"])
+def test_multi_layer_kv_transfer_acl_batch_dsa_scaling(
+    num_tokens,
+    slot_pattern,
+):
+    device = "npu"
+    num_layers = 79
+    block_size = 128
+    num_kv_heads = 1
+    kv_lora_rank = 512
+    qk_rope_head_dim = 128
+    dsa_head_dim = 128
+    dtype = torch.bfloat16
+    slot_offset = 3
+    num_blocks = (slot_offset + num_tokens + block_size - 1) // block_size
+    page_buffer_size = num_blocks * block_size
+
+    kv_cache_src = generate_dsa_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        dsa_head_dim=dsa_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    kv_cache_dst = generate_dsa_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        dsa_head_dim=dsa_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    kv_cache_component_dst = generate_dsa_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        dsa_head_dim=dsa_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    kv_cache_kernel_dst = generate_dsa_kv_cache(
+        num_blocks=num_blocks,
+        device=device,
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        dsa_head_dim=dsa_head_dim,
+        block_size=block_size,
+        dtype=dtype,
+    )
+    if slot_pattern == "consecutive":
+        slot_mapping_cpu = torch.arange(
+            slot_offset,
+            slot_offset + num_tokens,
+            dtype=torch.int64,
+            device="cpu",
+        )
+    else:
+        slot_mapping_cpu = torch.tensor(
+            random.sample(range(0, page_buffer_size), num_tokens),
+            dtype=torch.int64,
+            device="cpu",
+        )
+
+    total_hidden_dims = kv_lora_rank + qk_rope_head_dim + dsa_head_dim
+    total_elements = num_layers * num_tokens * total_hidden_dims
+    timing_bytes = total_elements * dtype.itemsize
+    mem_allocator = PinMemoryAllocator(timing_bytes * 6)
+    hidden_dims = [kv_lora_rank, qk_rope_head_dim, dsa_head_dim]
+    timing_label = (
+        f"DSA scaling {slot_pattern}, layers={num_layers}, "
+        f"tokens={num_tokens}, payload={timing_bytes / (1024**2):.1f} MiB"
+    )
+    acl_memory_obj = None
+    component_memory_obj = None
+    kernel_memory_obj = None
+    try:
+        acl_memory_obj = _run_acl_batch_tuple_format_roundtrip(
+            kv_cache_src,
+            kv_cache_dst,
+            slot_mapping_cpu,
+            page_buffer_size,
+            hidden_dims,
+            4,  # DSA_KV
+            mem_allocator,
+            timing_label=timing_label,
+            timing_bytes=timing_bytes,
+        )
+        check_paged_kv_cache_equal(
+            kv_cache_src,
+            kv_cache_dst,
+            slot_mapping_cpu.to(device=device, dtype=torch.long),
+            num_heads=num_kv_heads,
+            head_size=None,
+            kv_format=4,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            dsa_head_dim=dsa_head_dim,
+        )
+        component_memory_obj = _run_acl_batch_component_major_roundtrip(
+            kv_cache_src,
+            kv_cache_component_dst,
+            slot_mapping_cpu,
+            page_buffer_size,
+            hidden_dims,
+            mem_allocator,
+            timing_label,
+            timing_bytes,
+        )
+        check_paged_kv_cache_equal(
+            kv_cache_src,
+            kv_cache_component_dst,
+            slot_mapping_cpu.to(device=device, dtype=torch.long),
+            num_heads=num_kv_heads,
+            head_size=None,
+            kv_format=4,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            dsa_head_dim=dsa_head_dim,
+        )
+        kernel_memory_obj = _run_multi_layer_dsa_kernel_roundtrip(
+            kv_cache_src,
+            kv_cache_kernel_dst,
+            slot_mapping_cpu,
+            page_buffer_size,
+            hidden_dims,
+            mem_allocator,
+            timing_label,
+            timing_bytes,
+        )
+        check_paged_kv_cache_equal(
+            kv_cache_src,
+            kv_cache_kernel_dst,
+            slot_mapping_cpu.to(device=device, dtype=torch.long),
+            num_heads=num_kv_heads,
+            head_size=None,
+            kv_format=4,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            dsa_head_dim=dsa_head_dim,
+        )
+    finally:
+        if acl_memory_obj is not None:
+            acl_memory_obj.ref_count_down()
+        if component_memory_obj is not None:
+            component_memory_obj.ref_count_down()
+        if kernel_memory_obj is not None:
+            kernel_memory_obj.ref_count_down()
         mem_allocator.close()
         torch.npu.empty_cache()
 

@@ -44,9 +44,140 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
-        self.current_layer = 0
         self._wait_for_save_done = False
-        super().start_load_kv(forward_context, **kwargs)
+        self.current_layer = 0
+
+        if len(self.kv_caches) == 0:
+            logger.warning(
+                "Please update LMCacheConnector, "
+                "use register_kv_caches to init kv_caches"
+            )
+            self._init_kv_caches_from_forward_context(forward_context)
+
+        metadata = self._parent._get_connector_metadata()
+        assert isinstance(metadata, LMCacheConnectorMetadata)
+
+        assert len(self.kv_caches) > 0
+        kvcaches = list(self.kv_caches.values())
+
+        attn_metadata = forward_context.attn_metadata
+        if attn_metadata is None:
+            logger.debug("In connector.start_load_kv, but the attn_metadata is None")
+            return
+
+        assert self.lmcache_engine is not None
+
+        self.layerwise_retrievers = []
+
+        for idx, request in enumerate(metadata.requests):
+            if request.load_spec is None or not request.load_spec.can_load:
+                continue
+            last_idx = idx
+
+        for idx, request in enumerate(metadata.requests):
+            # Update metrics for all requests that have a load_spec
+            if request.load_spec is not None:
+                self._stats_monitor.update_interval_vllm_hit_tokens(
+                    request.load_spec.vllm_cached_tokens
+                )
+                self._stats_monitor.update_interval_prompt_tokens(
+                    len(request.token_ids)
+                )
+
+            if request.load_spec is None or not request.load_spec.can_load:
+                continue
+
+            tokens = request.token_ids
+            # lmcache-ascend start ---------------------
+            slot_mapping_cpu = request.slot_mapping
+            if self.store_async:
+                slot_mapping_cpu = slot_mapping_cpu.pin_memory()
+                with torch.npu.stream(self.lmcache_engine.gpu_connector.load_stream):
+                    slot_mapping_npu = slot_mapping_cpu.to(
+                        device="npu", dtype=torch.long, non_blocking=True
+                    )
+            else:
+                # TODO: have a pre-allocated buffer to hold the slot_mappings
+                slot_mapping_npu = slot_mapping_cpu.to(self.device)
+            # lmcache-ascend end ---------------------
+            assert len(tokens) == len(slot_mapping_cpu)
+
+            token_mask = torch.ones(len(tokens), dtype=torch.bool)
+            masked_token_count = (
+                request.load_spec.vllm_cached_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+            token_mask[:masked_token_count] = False
+
+            lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            if self.use_layerwise:
+                if idx == last_idx:
+                    sync = True
+                else:
+                    sync = False
+                # NOTE(Jiayi): Perform blending before layerwise prefix caching
+                if self.enable_blending:
+                    # TODO(Jiayi): Need to make prefix caching and blending compatible
+                    self.blender.blend(
+                        tokens[:lmcache_cached_tokens],
+                        token_mask[:lmcache_cached_tokens],
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping_npu[:lmcache_cached_tokens],
+                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                    )
+                else:
+                    layerwise_retriever = self.lmcache_engine.retrieve_layer(
+                        tokens[:lmcache_cached_tokens],
+                        token_mask[:lmcache_cached_tokens],
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping_npu[:lmcache_cached_tokens],
+                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        sync=sync,
+                    )
+                    # NOTE: retrieve for two layers at the first layer
+                    next(layerwise_retriever)
+                    next(layerwise_retriever)
+                    self.layerwise_retrievers.append(layerwise_retriever)
+            else:
+                ret_token_mask = self.lmcache_engine.retrieve(
+                    tokens[:lmcache_cached_tokens],
+                    token_mask[:lmcache_cached_tokens],
+                    kvcaches=kvcaches,
+                    slot_mapping_cpu=slot_mapping_cpu[:lmcache_cached_tokens],
+                    slot_mapping_npu=slot_mapping_npu[:lmcache_cached_tokens],
+                    vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                    request_configs=request.request_configs,
+                    req_id=request.req_id,
+                )
+
+                # Check the result
+                num_retrieved_tokens = ret_token_mask.sum().item()
+                num_expected_tokens = (
+                    lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
+                )
+                if num_retrieved_tokens < num_expected_tokens:
+                    logger.error(
+                        "Request %s"
+                        "The number of retrieved tokens is less than the "
+                        "expected number of tokens! This should not happen!",
+                        request.req_id,
+                    )
+                    logger.error(
+                        "Num retrieved tokens: %d, num expected tokens: %d",
+                        num_retrieved_tokens,
+                        num_expected_tokens,
+                    )
+                    """
+                    Report failed block IDs in case of partial failure.
+                    """
+                    missing_blocks = self.record_failed_blocks(
+                        request.req_id,
+                        token_mask[:lmcache_cached_tokens],
+                        ret_token_mask,
+                        slot_mapping_cpu[:lmcache_cached_tokens],
+                    )
+                    self._invalid_block_ids.update(missing_blocks)
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):

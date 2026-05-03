@@ -918,8 +918,8 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
-        if "slot_mapping" not in kwargs:
-            raise ValueError("'slot_mapping' should be provided in kwargs.")
+        if "slot_mapping_npu" not in kwargs:
+            raise ValueError("'slot_mapping_npu' should be provided in kwargs.")
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
@@ -1209,9 +1209,6 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             else:
                 self.from_gpu(memory_obj, start, end, **kwargs)
 
-        # Even when aclrtMemcpyBatch is host-synchronous, from_gpu can enqueue
-        # NPU-side setup on store_stream, such as KV pointer tensor copies used
-        # by the later to_gpu kernel. Drain that work before publishing memory.
         self.store_stream.synchronize()
 
     def get_shape(self, num_tokens: int) -> torch.Size:

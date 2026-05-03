@@ -762,6 +762,25 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             and self.use_dsa_component_major_acl
         )
 
+    def _should_use_dsa_component_major_transfer(self, memory_obj: MemoryObj) -> bool:
+        if self.kv_format != KVCacheFormat.DSA_KV:
+            return False
+
+        if memory_obj.metadata.fmt == MemoryFormat.KV_DSA_COMPONENT_MAJOR:
+            return True
+
+        # Some raw remote connectors do not persist per-chunk MemoryFormat and
+        # allocate DSA chunks with the static MLA single-plane format. If this
+        # connector is configured to store DSA as component-major, interpret
+        # those single-plane chunks the same way on retrieval.
+        return (
+            self._use_dsa_component_major_acl()
+            and memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT
+            and memory_obj.tensor is not None
+            and memory_obj.tensor.dim() == 4
+            and memory_obj.tensor.shape[0] == 1
+        )
+
     def _dsa_component_major_transfer(
         self,
         memory_obj: MemoryObj,
@@ -844,10 +863,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         slot_mapping_cpu: torch.Tensor = kwargs["slot_mapping_cpu"]
         slot_mapping_npu: torch.Tensor = kwargs["slot_mapping_npu"]
 
-        if (
-            self.kv_format == KVCacheFormat.DSA_KV
-            and memory_obj.metadata.fmt == MemoryFormat.KV_DSA_COMPONENT_MAJOR
-        ):
+        if self._should_use_dsa_component_major_transfer(memory_obj):
             assert slot_mapping_cpu is not None
             self._dsa_component_major_transfer(
                 memory_obj, slot_mapping_cpu, start, end, False

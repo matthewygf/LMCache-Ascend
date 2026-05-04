@@ -84,10 +84,14 @@ def test_vllm_paged_connector_v2_to_npu_bench(benchmark):
 
 
 def test_vllm_paged_connector_dsa_component_major_to_gpu_routes_acl(monkeypatch):
+    # Component-major DSA chunks share the KV_MLA_FMT wire tag with classic
+    # MLA single-plane chunks; dispatch is decided by the connector's
+    # ``use_dsa_component_major_acl`` config plus tensor geometry.  This test
+    # verifies that path routes into ``_dsa_component_major_transfer``.
     connector = VLLMPagedMemNPUConnectorV2.__new__(VLLMPagedMemNPUConnectorV2)
     connector.kv_format = KVCacheFormat.DSA_KV
-    connector.use_acl_batch = False
-    connector.use_dsa_component_major_acl = False
+    connector.use_acl_batch = True
+    connector.use_dsa_component_major_acl = True
     connector.kvcaches = [object()]
 
     monkeypatch.setattr(
@@ -107,8 +111,8 @@ def test_vllm_paged_connector_dsa_component_major_to_gpu_routes_acl(monkeypatch)
     )
 
     memory_obj = SimpleNamespace(
-        tensor=torch.empty(1),
-        metadata=SimpleNamespace(fmt=MemoryFormat.KV_DSA_COMPONENT_MAJOR),
+        tensor=torch.empty(1, 1, 4, 1),
+        metadata=SimpleNamespace(fmt=MemoryFormat.KV_MLA_FMT),
     )
     slot_mapping = torch.arange(4, dtype=torch.int64)
 

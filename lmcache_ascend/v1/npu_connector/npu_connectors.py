@@ -766,13 +766,6 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         if self.kv_format != KVCacheFormat.DSA_KV:
             return False
 
-        if memory_obj.metadata.fmt == MemoryFormat.KV_DSA_COMPONENT_MAJOR:
-            return True
-
-        # Some raw remote connectors do not persist per-chunk MemoryFormat and
-        # allocate DSA chunks with the static MLA single-plane format. If this
-        # connector is configured to store DSA as component-major, interpret
-        # those single-plane chunks the same way on retrieval.
         return (
             self._use_dsa_component_major_acl()
             and memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT
@@ -835,13 +828,11 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             valid_formats = (
                 MemoryFormat.KV_2LTD,
                 MemoryFormat.KV_MLA_FMT,
-                MemoryFormat.KV_DSA_COMPONENT_MAJOR,
             )
             if memory_obj.metadata.fmt not in valid_formats:
                 raise ValueError(
-                    "The DSA memory object should be in KV_2LTD, KV_MLA_FMT, "
-                    "or KV_DSA_COMPONENT_MAJOR format in order to be processed "
-                    "by VLLMPagedMemNPUConnector."
+                    "The DSA memory object should be in KV_2LTD or KV_MLA_FMT "
+                    "format in order to be processed by VLLMPagedMemNPUConnector."
                 )
         elif self.use_mla:
             if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
@@ -993,9 +984,18 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             # memory object
             self.store_stream.synchronize()
 
-        if self._use_dsa_component_major_acl():
-            memory_obj.metadata.fmt = MemoryFormat.KV_DSA_COMPONENT_MAJOR
-        elif self.use_mla or self.kv_format == KVCacheFormat.MLA_KV:
+        if (
+            self._use_dsa_component_major_acl()
+            or self.use_mla
+            or self.kv_format == KVCacheFormat.MLA_KV
+        ):
+            # Component-major DSA chunks share the same single-plane
+            # [1, num_layers, num_tokens, *] geometry as classic MLA, so we
+            # tag them with KV_MLA_FMT on the wire.  Interpretation is
+            # re-derived on the receive side from this connector's
+            # ``use_dsa_component_major_acl`` config plus tensor geometry,
+            # which avoids inventing a new MemoryFormat enum value (and
+            # therefore avoids forking upstream MemoryFormat).
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):

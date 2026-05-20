@@ -24,3 +24,4 @@ schedule.log
 # claude
 CLAUDE.md
 .claude/
+*.log

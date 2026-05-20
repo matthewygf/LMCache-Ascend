@@ -121,6 +121,7 @@ def CreateTransferChannel(
 
     assert channel_type in [
         "hccl",
+        "hccl_pingpong",
         "hixl",
         "hcomm_onesided",
     ], f"Unsupported channel type: {channel_type}"
@@ -149,6 +150,20 @@ def CreateTransferChannel(
         )
 
         return HcommOneSidedChannel(
+            async_mode=async_mode,
+            buffers=buffer_configs,
+            role=role,
+            tp_rank=tp_rank,
+            peer_init_url=peer_init_url,
+            **kwargs,
+        )
+    elif channel_type == "hccl_pingpong":
+        # First Party
+        from lmcache_ascend.v1.transfer_channel.hccl_pingpong_channel import (
+            HcclPingPongChannel,
+        )
+
+        return HcclPingPongChannel(
             async_mode=async_mode,
             buffers=buffer_configs,
             role=role,

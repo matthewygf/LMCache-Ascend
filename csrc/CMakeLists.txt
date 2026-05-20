@@ -7,6 +7,7 @@ find_package(pybind11 REQUIRED)
 
 option(USE_HIXL "Build HIXL transfer channel instead of HCCL (for CANN >= 8.5)" OFF)
 option(USE_HCOMM_ONESIDED "Build hcomm one-sided transfer channel (stream-aware)" OFF)
+option(USE_HCCL_PINGPONG "Build hccl_pingpong transfer channel (depends on hcomm headers)" ON)
 
 if(DEFINED HCOMM_SRC_PATH AND NOT HCOMM_SRC_PATH STREQUAL "")
   message(STATUS "HCOMM_SRC_PATH set: building hccl_npu_comms")
@@ -16,6 +17,11 @@ endif()
 if(USE_HIXL)
   message(STATUS "USE_HIXL=ON: building hixl_npu_comms")
   add_subdirectory(hixl)
+endif()
+
+if(USE_HCCL_PINGPONG)
+  message(STATUS "USE_HCCL_PINGPONG=ON: building hccl_pingpong_npu_comms")
+  add_subdirectory(hccl_pingpong)
 endif()
 
 if(USE_HCOMM_ONESIDED)

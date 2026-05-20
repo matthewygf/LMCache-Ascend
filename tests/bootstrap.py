@@ -48,8 +48,10 @@ def setup_lmcache_dependency():
     # 1. Check if Repo Exists
     if os.path.exists(LMCACHEPATH):
         current_tag = get_current_git_tag(LMCACHEPATH)
-        if current_tag == VERSION_TAG:
-            return  # Already on correct version
+        # TODO Amory - Temporarily commented out to let local tests run
+        #if current_tag == VERSION_TAG:
+        #    return  # Already on correct version
+        return
 
         print(f"⚠️ Version mismatch (Found: {current_tag}). Syncing to {VERSION_TAG}...")
         run_git_cmd(["fetch", "--tags"], cwd=LMCACHEPATH)

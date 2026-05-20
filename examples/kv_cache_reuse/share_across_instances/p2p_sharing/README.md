@@ -24,6 +24,7 @@ The `transfer_channel` field in the LMCache YAML config selects the NPU communic
 | `hccl` | CANN 8.3+ | Legacy |
 | `hcomm_onesided` | CANN 8.5+ | **Recommended** |
 | `hixl` | CANN 8.5+ | Experimental |
+| `hccl_pingpong` | CANN 8.5+ | Experimental (receiver-driven, staging via BatchChannel) |
 
 To switch channels, update the `transfer_channel` field in your YAML configs:
 
@@ -36,9 +37,14 @@ transfer_channel: "hcomm_onesided"
 
 # CANN 8.5+ (experimental)
 transfer_channel: "hixl"
+
+# CANN 8.5+ (experimental, receiver-driven ping-pong staging)
+transfer_channel: "hccl_pingpong"
 ```
 
 The build system auto-detects the installed CANN version and compiles the correct backend. The provided example configs default to `hcomm_onesided`.
+
+For `hccl_pingpong`, see `example1_pingpong.yaml` / `example2_pingpong.yaml` for a worked example with `p2p_pull_mode` + `p2p_delay_pull` enabled. Optional `pp_*` knobs (chunk size, ping-pong buffer count, RoCE TC/SL, advertised host) can be set under `extra_config:` and are forwarded into the channel by `AscendP2PBackend._collect_pingpong_kwargs`.
 
 ### Usage
 
@@ -47,7 +53,7 @@ Ensure the LMCache config files are correctly configured for the desired paralle
 Launch controller
 
 ```bash
-PYTHONHASHSEED=123 lmcache_controller --host 0.0.0.0 --port 9000 --monitor-ports '{"pull": 8600, "reply": 8700}'
+PYTHONHASHSEED=123 lmcache_controller --host 0.0.0.0 --port 9000 --monitor-ports '{"pull": 9800, "reply": 9900}'
 ```
 
 Launch instance 1

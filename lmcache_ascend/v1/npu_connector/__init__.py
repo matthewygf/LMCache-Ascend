@@ -37,11 +37,17 @@ def CreateNPUConnector(
     metadata: LMCacheMetadata,
     engine: EngineType,
     layout_hints: Optional[LayoutHints] = None,
+    **_unused,
 ) -> GPUConnectorInterface:
     """Factory function to create NPU connectors on Ascend.
 
     Replaces upstream CreateGPUConnector to return Ascend NPU-specific
     connector implementations.
+
+    Note: ``**_unused`` swallows forward-compat kwargs from upstream
+    LMCache (e.g. ``layout_hints`` introduced after v0.4.2). The NPU
+    connectors derive layout from ``kv_caches`` at runtime via
+    ``KVCacheFormat.detect``, so dropping these is functionally a no-op.
     """
     use_gpu = need_gpu_interm_buffer(config)
 

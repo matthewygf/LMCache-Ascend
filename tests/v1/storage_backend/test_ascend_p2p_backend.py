@@ -1304,3 +1304,97 @@ class TestAscendP2PBackendUnit:
 
         late_obj.ref_count_down.assert_called_once()
         late_obj.unpin.assert_not_called()
+
+    # ──────────────────────────────────────────────────────────
+    # _collect_pingpong_kwargs
+    # ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _make_extra_config_stub(extra: dict) -> MagicMock:
+        """Build a config stub whose ``get_extra_config_value(key, default)``
+        returns ``extra[key]`` when present and ``default`` otherwise.
+        Mirrors the real ``LMCacheEngineConfig`` lookup contract closely
+        enough for ``_collect_pingpong_kwargs`` to run unmodified.
+        """
+        cfg = MagicMock()
+
+        def _get(key, default=None):
+            return extra[key] if key in extra else default
+
+        cfg.get_extra_config_value.side_effect = _get
+        return cfg
+
+    def test_collect_pingpong_kwargs_defaults_to_peer_host(self):
+        """No ``pp_*`` keys in extra_config -> only the advertised host is set,
+        and it falls back to ``self.peer_host``. Channel ``PingPongConfig``
+        defaults remain authoritative for everything else.
+        """
+        backend = MagicMock()
+        backend.peer_host = "10.0.0.5"
+
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        cfg = self._make_extra_config_stub({})
+        kwargs = AscendP2PBackend._collect_pingpong_kwargs(backend, cfg)
+
+        assert kwargs == {"pp_advertised_host": "10.0.0.5"}
+
+    def test_collect_pingpong_kwargs_forwards_set_values(self):
+        """Explicit ``pp_*`` knobs in extra_config are forwarded verbatim."""
+        backend = MagicMock()
+        backend.peer_host = "127.0.0.1"
+
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        extra = {
+            "pp_chunk_size_bytes": 1 << 20,
+            "pp_n_chunks_per_buff": 16,
+            "pp_n_buffs": 2,
+            "pp_wait_recv_done": False,
+            "pp_tc": 4,
+            "pp_sl": 5,
+            "pp_transfer_bind_addr": "0.0.0.0:6000",
+        }
+        cfg = self._make_extra_config_stub(extra)
+        kwargs = AscendP2PBackend._collect_pingpong_kwargs(backend, cfg)
+
+        for key, value in extra.items():
+            assert kwargs[key] == value
+        # pp_advertised_host still gets defaulted from peer_host.
+        assert kwargs["pp_advertised_host"] == "127.0.0.1"
+
+    def test_collect_pingpong_kwargs_explicit_advertised_host_overrides(self):
+        """``pp_advertised_host`` from extra_config wins over peer_host."""
+        backend = MagicMock()
+        backend.peer_host = "127.0.0.1"
+
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        cfg = self._make_extra_config_stub(
+            {"pp_advertised_host": "192.168.1.42"}
+        )
+        kwargs = AscendP2PBackend._collect_pingpong_kwargs(backend, cfg)
+
+        assert kwargs == {"pp_advertised_host": "192.168.1.42"}
+
+    def test_collect_pingpong_kwargs_skips_none_only(self):
+        """Falsy-but-meaningful values (0, False) are still forwarded; only
+        explicit ``None`` (i.e. unset) is dropped. Guards against accidentally
+        suppressing ``pp_tc=0`` or ``pp_wait_recv_done=False``.
+        """
+        backend = MagicMock()
+        backend.peer_host = "127.0.0.1"
+
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        cfg = self._make_extra_config_stub(
+            {"pp_tc": 0, "pp_wait_recv_done": False}
+        )
+        kwargs = AscendP2PBackend._collect_pingpong_kwargs(backend, cfg)
+
+        assert kwargs["pp_tc"] == 0
+        assert kwargs["pp_wait_recv_done"] is False

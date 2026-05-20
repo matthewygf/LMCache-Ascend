@@ -283,6 +283,14 @@ class AscendP2PBackend(P2PBackend):
         self.chunk_size = config.chunk_size
 
         # Keep transfer-channel ZMQ I/O on the Ascend P2P backend loop.
+        # Optional pp_* tuning passthrough for the hccl_pingpong channel.
+        # Other channel types ignore unknown kwargs, so it is safe to always
+        # forward them. Defaults inside the channel's ``PingPongConfig`` are
+        # used for any key not present in ``extra_config``. We also pin the
+        # channel's advertised host to ``peer_host`` so that wildcard binds
+        # (``0.0.0.0:0``) get rewritten into a routable host on init replies.
+        pp_kwargs = self._collect_pingpong_kwargs(config)
+
         self.transfer_channel = CreateTransferChannel(
             channel_type=config.transfer_channel,
             async_mode=True,
@@ -295,6 +303,7 @@ class AscendP2PBackend(P2PBackend):
             peer_init_url=self.peer_init_url,
             peer_lookup_url=self.peer_lookup_url,
             event_loop=self.loop,
+            **pp_kwargs,
         )
 
         self.running = asyncio.Event()
@@ -458,6 +467,46 @@ class AscendP2PBackend(P2PBackend):
     ) -> None:
         await self._wait_for_async_context()
         await super()._ensure_peer_connection(target_peer_init_url, force_update)
+        
+    def _collect_pingpong_kwargs(self, config: LMCacheEngineConfig) -> dict:
+        """Pull optional ``pp_*`` tuning knobs from ``config.extra_config``.
+
+        Returns a dict suitable for ``**`` unpacking into
+        :func:`CreateTransferChannel`. Only keys explicitly set in
+        ``extra_config`` are forwarded, so the channel's
+        ``PingPongConfig`` defaults stay authoritative when the user
+        leaves them unset. ``pp_advertised_host`` falls back to
+        ``self.peer_host`` so that wildcard binds (``0.0.0.0:0``) get a
+        routable host on init replies — without this every receiver
+        would otherwise hand peers an unreachable ``0.0.0.0`` URL.
+
+        Other channel types (hccl, hixl, hcomm_onesided) accept
+        ``**kwargs`` and ignore unknown keys, so it is safe to forward
+        these unconditionally. The forwarding is a no-op unless
+        ``transfer_channel == "hccl_pingpong"``.
+        """
+        pp_keys = (
+            "pp_chunk_size_bytes",
+            "pp_n_chunks_per_buff",
+            "pp_n_buffs",
+            "pp_wait_recv_done",
+            "pp_tc",
+            "pp_sl",
+            "pp_transfer_bind_addr",
+        )
+        pp_kwargs: dict = {}
+        for key in pp_keys:
+            value = config.get_extra_config_value(key, None)
+            if value is not None:
+                pp_kwargs[key] = value
+
+        # Default the advertised host to ``peer_host`` so wildcard binds
+        # become reachable. Caller can still override via extra_config.
+        pp_kwargs.setdefault(
+            "pp_advertised_host",
+            config.get_extra_config_value("pp_advertised_host", self.peer_host),
+        )
+        return pp_kwargs
 
     async def _handle_peer_requests(self):
         """

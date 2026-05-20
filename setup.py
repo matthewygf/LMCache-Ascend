@@ -5,6 +5,7 @@ import configparser
 import glob
 import logging
 import os
+import shlex
 import platform
 import re
 import shutil
@@ -348,6 +349,14 @@ class CustomAscendCmakeBuildExt(build_ext):
             cmake_cmd += [f"  -DTorch_DIR={torch_cmake_dir}"]
             cmake_cmd += [f"  -DHCOMM_SRC_PATH={hcomm_src_path}"]
 
+        # hccl_pingpong needs internal hcomm headers; honor a checked-out hcomm tree.
+        hcomm_src = os.environ.get("HCOMM_SRC_PATH")
+        if hcomm_src:
+            pub_inc = os.path.join(hcomm_src, "src", "pub_inc")
+            pkg_inc = os.path.join(hcomm_src, "pkg_inc")
+            cmake_cmd += [f"  -DHCOMM_PUB_INC_DIR={shlex.quote(pub_inc)}"]
+            cmake_cmd += [f"  -DHCOMM_PKG_INC_DIR={shlex.quote(pkg_inc)}"]
+
         if self._cann_version_8_5:
             cmake_cmd += ["  -DUSE_HIXL=ON"]
             cmake_cmd += ["  -DUSE_HCOMM_ONESIDED=ON"]
@@ -380,6 +389,14 @@ class CustomAscendCmakeBuildExt(build_ext):
             expected_patterns.append("hccl_npu_comms*.so")
             expected_patterns.append("hixl_npu_comms*.so")
             expected_patterns.append("hcomm_onesided*.so")
+            # Same optional ping-pong module as on older CANN (needs hcomm checkout).
+            expected_patterns.append("hccl_pingpong_npu_comms*.so")
+        else:
+            expected_patterns.append("hccl_npu_comms*.so")
+            # hccl_pingpong is built only when the internal HCOMM headers are
+            # available locally. Glob silently no-ops when absent, so this
+            # remains optional.
+            expected_patterns.append("hccl_pingpong_npu_comms*.so")
 
         # Search for files matching our patterns
         so_files = []

@@ -1003,6 +1003,7 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 ]
                 pool_scatter_recorded = [False, False]
 
+                # TODO (Amory): Merge this all in single kernel
                 for batch_idx, batch in enumerate(micro_batches):
                     pool = pools[current_pool]
 

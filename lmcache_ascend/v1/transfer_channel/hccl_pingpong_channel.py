@@ -265,7 +265,23 @@ class HcclPingPongChannel(BaseTransferChannel):
         # device. The agent's shared input/output regions are not safe for
         # concurrent use across peers.
         self._transfer_lock = threading.Lock()
-        self._peers: Dict[str, _PeerState] = {}
+        # Bidirectional traffic on the same channel needs *two* per-peer
+        # dictionaries, not one. A single dict keyed by the remote process'
+        # id would collide because both roles end up using the same key:
+        #   - the *connector* role (we initiated the BatchChannel connect to
+        #     the remote, so we hold a live ``transfer_req_socket`` and a
+        #     ``conn_handle`` from ``agent.connect()``);
+        #   - the *listener* role (the remote initiated to us, so we hold a
+        #     ``conn_handle`` from ``agent.accept()`` and have
+        #     ``transfer_req_socket=None`` because we never originate
+        #     transfer requests in this direction — we only receive them).
+        # Under DP-induced bidirectional pulls the second-inserted entry
+        # would silently overwrite the first, and any later transfer in the
+        # losing direction would crash on ``peer.transfer_req_socket.send``
+        # (AttributeError on None). Keeping the two roles in separate dicts
+        # is the simplest way to keep both peer states alive simultaneously.
+        self._connector_peers: Dict[str, _PeerState] = {}
+        self._listener_peers: Dict[str, _PeerState] = {}
         self.side_channels: List[zmq.Socket] = []
         self.running_threads: List[threading.Thread] = []
 
@@ -346,9 +362,27 @@ class HcclPingPongChannel(BaseTransferChannel):
             last_endpoint = last_endpoint.decode("utf-8")
         self.transfer_url = self._resolve_transfer_url(last_endpoint, kwargs)
 
-        # transport stream is used for every BatchChannel-bound op on this
-        # device, mirroring HcclChannel.
+        # Outbound-pull stream: every connector-side recv_batch /
+        # scatter_recv (batched_read, async_batched_read,
+        # submit_batched_read, async_batched_scatter) is queued here so
+        # the caller can pipeline reads behind a recorded event (see
+        # ``NPUConnector._batched_to_gpu_proxy`` which calls
+        # ``transport_stream.wait_event(...)``).
         self.transport_stream = torch.npu.Stream(torch.npu.current_device())
+        # Inbound-serve stream: listener-side send_batch / scatter_send
+        # MUST run on a separate stream from ``transport_stream``.
+        # Reusing one stream for both directions deadlocks under
+        # symmetric cross-rank pulls: each side's listener-side
+        # ``send_batch`` is FIFO-queued behind its OWN main-thread
+        # ``recv_batch``, that ``recv_batch`` can only complete when
+        # the peer's ``send_batch`` drains, and the peer's
+        # ``send_batch`` is similarly blocked behind its own pending
+        # recv. Symptom (DP=2, TP=4 Qwen3-30B): DPx_TPi and DPy_TPi
+        # both wedge in ``_wait_for_transfer_ack`` while the other 6
+        # workers stall at the next TP-AllReduce. Splitting the
+        # streams keeps the two FIFOs independent so inbound sends
+        # always drain regardless of pending outbound recvs.
+        self._send_stream = torch.npu.Stream(torch.npu.current_device())
 
         self._init_side_channels()
         self._start_transfer_worker()
@@ -432,7 +466,11 @@ class HcclPingPongChannel(BaseTransferChannel):
     ) -> Optional[InitSideRetMsgBase]:
         self._capture_local_id(local_id)
         with self._state_lock:
-            already_has_peer = peer_id in self._peers
+            # Only the connector dict matters for "have I already initiated
+            # to this peer?". A pre-existing entry in ``_listener_peers``
+            # means they initiated to us, which does NOT give us a
+            # transfer_req_socket, so we must still run our own handshake.
+            already_has_peer = peer_id in self._connector_peers
         if already_has_peer:
             if init_side_msg is None:
                 return None
@@ -480,7 +518,8 @@ class HcclPingPongChannel(BaseTransferChannel):
     ) -> Optional[InitSideRetMsgBase]:
         self._capture_local_id(local_id)
         with self._state_lock:
-            already_has_peer = peer_id in self._peers
+            # See sync variant: connector dict only.
+            already_has_peer = peer_id in self._connector_peers
         if already_has_peer:
             if init_side_msg is None:
                 return None
@@ -562,11 +601,16 @@ class HcclPingPongChannel(BaseTransferChannel):
         # a transfer.
         peer.ready_event.set()
         with self._state_lock:
-            self._peers[peer_id] = peer
+            self._connector_peers[peer_id] = peer
 
     def remote_xfer_handler_exists(self, receiver_or_sender_id: str) -> bool:
+        # Called by the sender-side P2P backend handler to confirm that the
+        # receiver has previously initiated the BatchChannel handshake to us
+        # (so we can satisfy its lookup-and-get). That handshake lives in
+        # ``_listener_peers``; the connector dict tracks the *opposite*
+        # direction (us pulling from them) and is irrelevant here.
         with self._state_lock:
-            return receiver_or_sender_id in self._peers
+            return receiver_or_sender_id in self._listener_peers
 
     # ------------------------------------------------------------------
     # _init_loop / _async_init_loop
@@ -602,7 +646,12 @@ class HcclPingPongChannel(BaseTransferChannel):
             )
             local_id = req.local_id
             with self._state_lock:
-                self._peers[local_id] = peer
+                # Note: we intentionally do NOT touch ``_connector_peers``
+                # here. If the local channel is also pulling from this same
+                # remote (bidirectional traffic under DP), that direction
+                # has its own peer state with a live transfer_req_socket
+                # which must survive this insert.
+                self._listener_peers[local_id] = peer
 
             accept_started = threading.Event()
 
@@ -621,8 +670,8 @@ class HcclPingPongChannel(BaseTransferChannel):
                     # from the same local_id is allowed to retry instead of
                     # being short-circuited by ``remote_xfer_handler_exists``.
                     with self._state_lock:
-                        if self._peers.get(local_id) is peer:
-                            del self._peers[local_id]
+                        if self._listener_peers.get(local_id) is peer:
+                            del self._listener_peers[local_id]
                     logger.error(
                         "PingPong handshake failed for %s: %s", local_id, e
                     )
@@ -773,7 +822,10 @@ class HcclPingPongChannel(BaseTransferChannel):
     def _handle_read_request(self, req: PingPongReadRequest) -> None:
         if len(req.sender_local_addrs) != len(req.sizes):
             raise ValueError("PingPongReadRequest sizes/addrs length mismatch")
-        peer = self._await_peer_ready(req.receiver_id)
+        # We are the sender side here — the receiver (req.receiver_id)
+        # initiated the BatchChannel handshake to us, so its peer entry
+        # lives in the listener registry.
+        peer = self._await_peer_ready(req.receiver_id, role="listener")
         conn_handle = peer.conn_handle
 
         ops = [
@@ -782,14 +834,22 @@ class HcclPingPongChannel(BaseTransferChannel):
                 req.sender_local_addrs, req.sizes, strict=True
             )
         ]
+        # Submit send_batch under ``_transfer_lock`` (briefly serializes
+        # access to the shared ``agent`` object), then release the lock
+        # BEFORE blocking on ``_send_stream.synchronize()``. Mirrors the
+        # connector-side discipline in ``batched_read`` — holding the
+        # lock through synchronize would block the main thread from
+        # acquiring it to issue a concurrent ``recv_batch``, defeating
+        # half the point of splitting send/recv onto separate streams.
         with self._transfer_lock:
             self.agent.send_batch(
-                conn_handle, ops, self.transport_stream.npu_stream
+                conn_handle, ops, self._send_stream.npu_stream
             )
-            self.transport_stream.synchronize()
+        self._send_stream.synchronize()
 
     def _handle_scatter_request(self, req: PingPongScatterRequest) -> None:
-        peer = self._await_peer_ready(req.receiver_id)
+        # Sender side: see ``_handle_read_request`` for the role rationale.
+        peer = self._await_peer_ready(req.receiver_id, role="listener")
         conn_handle = peer.conn_handle
 
         entries = []
@@ -801,11 +861,12 @@ class HcclPingPongChannel(BaseTransferChannel):
             cpp_entry.data_type = hpp.HcclDataType(entry.data_type)
             entries.append(cpp_entry)
 
+        # See ``_handle_read_request`` for the lock/stream discipline.
         with self._transfer_lock:
             self.agent.scatter_send(
-                conn_handle, entries, self.transport_stream.npu_stream
+                conn_handle, entries, self._send_stream.npu_stream
             )
-            self.transport_stream.synchronize()
+        self._send_stream.synchronize()
 
     # ------------------------------------------------------------------
     # Local helpers
@@ -847,7 +908,9 @@ class HcclPingPongChannel(BaseTransferChannel):
         ):
             peer_id = transfer_spec[TS_RECEIVER_ID]
             with self._state_lock:
-                remote_buffers = self._peers[peer_id].remote_buffers
+                # Only the connector-side entry carries the remote sender's
+                # buffer descriptors that the receiver-driven pull needs.
+                remote_buffers = self._connector_peers[peer_id].remote_buffers
             return [
                 remote_buffers.resolve_addr(buf_uuid, page_idx)
                 for buf_uuid, page_idx in zip(
@@ -869,9 +932,20 @@ class HcclPingPongChannel(BaseTransferChannel):
         self,
         peer_id: str,
         timeout: float = _PEER_READY_TIMEOUT_SEC,
+        role: str = "connector",
     ) -> _PeerState:
-        """Look up ``peer_id`` and block until its BatchChannel handshake
-        has completed (or surface the handshake error).
+        """Look up ``peer_id`` in the dict for ``role`` and block until its
+        BatchChannel handshake has completed (or surface the handshake error).
+
+        ``role`` must be either ``"connector"`` (the caller wants the peer
+        entry we created when WE initiated the BatchChannel handshake to
+        the remote — has a live ``transfer_req_socket``) or ``"listener"``
+        (the caller is a sender-side handler servicing a transfer request
+        from a remote that initiated to us — no ``transfer_req_socket``).
+        Passing the wrong role will surface as either an ``AttributeError``
+        on a ``None`` socket (connector op on a listener entry) or a
+        ``KeyError`` (the directions just didn't share a peer at the time
+        of the call).
 
         Closes the race where the listener-side ``_handle_init_msg`` has
         already sent ``PingPongInitResponse`` (so the connector now knows
@@ -884,10 +958,21 @@ class HcclPingPongChannel(BaseTransferChannel):
         ``_register_peer``, so this is effectively a same-thread
         ``Event.is_set()`` check on that path.
         """
+        if role == "connector":
+            registry = self._connector_peers
+        elif role == "listener":
+            registry = self._listener_peers
+        else:
+            raise ValueError(
+                f"_await_peer_ready: unknown role {role!r}; "
+                "expected 'connector' or 'listener'"
+            )
         with self._state_lock:
-            peer = self._peers.get(peer_id)
+            peer = registry.get(peer_id)
         if peer is None:
-            raise KeyError(f"Unknown peer {peer_id!r}")
+            raise KeyError(
+                f"Unknown peer {peer_id!r} for role {role!r}"
+            )
         if not peer.ready_event.wait(timeout=timeout):
             raise TimeoutError(
                 f"PingPong: peer {peer_id!r} handshake did not complete "
@@ -930,7 +1015,10 @@ class HcclPingPongChannel(BaseTransferChannel):
         transfer_spec: dict,
     ) -> Tuple[_PeerState, List[int], List[int], List[int]]:
         peer_id = transfer_spec[TS_RECEIVER_ID]
-        peer = self._await_peer_ready(peer_id)
+        # batched_read / submit_batched_read are the receiver-driven pull
+        # path: we are the connector to the remote sender, so we need the
+        # peer entry that carries our ``transfer_req_socket``.
+        peer = self._await_peer_ready(peer_id, role="connector")
         sender_local_addrs = self._resolve_remote_addrs(transfer_spec)
 
         local_dst_addrs: List[int] = []
@@ -974,8 +1062,18 @@ class HcclPingPongChannel(BaseTransferChannel):
             hpp.PingPongOp(local_addr=addr, size=size)
             for addr, size in zip(local_dst_addrs, sizes, strict=True)
         ]
-        with self._transfer_lock:
-            with peer.transfer_req_lock:
+        # Lock acquisition order is peer.transfer_req_lock -> _transfer_lock:
+        # the per-peer lock serializes REQ/REP framing on this socket (only
+        # one outstanding request at a time), the channel-wide lock guards
+        # the agent's shared input region during recv_batch submission. We
+        # MUST release ``_transfer_lock`` before blocking on the sender's
+        # ack -- if we hold it through the ack wait, the channel's own
+        # ``_transfer_loop`` cannot acquire it to service an incoming
+        # ``PingPongReadRequest`` from the symmetric peer, and under DP
+        # bidirectional cross-rank pulls A and B mutually deadlock waiting
+        # for each other's ack.
+        with peer.transfer_req_lock:
+            with self._transfer_lock:
                 peer.transfer_req_socket.send(msgspec.msgpack.encode(req))
                 # Submit the local recv concurrently with the remote send so
                 # ping-pong wraparound (which needs receiver-side recvReady
@@ -983,22 +1081,26 @@ class HcclPingPongChannel(BaseTransferChannel):
                 self.agent.recv_batch(
                     peer.conn_handle, ops, self.transport_stream.npu_stream
                 )
-                # NOBLOCK-poll the REQ socket. We must NOT pre-emptively
-                # synchronize() the stream here -- if the sender rejects the
-                # request it will never post the matching sendDoneSlot
-                # notifies and synchronize() would deadlock.
-                ack_bytes = self._wait_for_transfer_ack(peer)
-            ack = msgspec.msgpack.decode(ack_bytes, type=PingPongMsg)
-            # Raises on ok=False, leaving the stream queue intact for the
-            # HCCL transport timeout to drain (see poisoned-streams note in
-            # _wait_for_transfer_ack).
-            self._raise_on_ack_failure(ack)
-            # Happy path only: the sender synchronized its own stream
-            # BEFORE sending the ok ack, so every sendDoneSlot Post is
-            # already on the wire. Our queued Waits clear in microseconds
-            # and synchronize() returns immediately once the receiver-side
-            # memcpys finish populating the user buffer.
-            self.transport_stream.synchronize()
+            # NOBLOCK-poll the REQ socket. We must NOT pre-emptively
+            # synchronize() the stream here -- if the sender rejects the
+            # request it will never post the matching sendDoneSlot
+            # notifies and synchronize() would deadlock. The poll runs
+            # WITHOUT _transfer_lock so the listener side stays responsive.
+            ack_bytes = self._wait_for_transfer_ack(peer)
+        ack = msgspec.msgpack.decode(ack_bytes, type=PingPongMsg)
+        # Raises on ok=False, leaving the stream queue intact for the
+        # HCCL transport timeout to drain (see poisoned-streams note in
+        # _wait_for_transfer_ack).
+        self._raise_on_ack_failure(ack)
+        # Happy path only: the sender synchronized its own stream
+        # BEFORE sending the ok ack, so every sendDoneSlot Post is
+        # already on the wire. Our queued Waits clear in microseconds
+        # and synchronize() returns immediately once the receiver-side
+        # memcpys finish populating the user buffer. Listener-side
+        # send_batch lives on ``_send_stream`` (NOT this stream), so
+        # there is no cross-direction FIFO interference — see the
+        # stream-split rationale in ``__init__``.
+        self.transport_stream.synchronize()
         return len(buffers)
 
     async def async_batched_read(
@@ -1034,20 +1136,24 @@ class HcclPingPongChannel(BaseTransferChannel):
             # the current ACL device id doesn't match transport_stream's
             # device. Mirrors async_lazy_init_peer_connection._connect_blocking.
             torch.npu.set_device(self.handle_device)
-            with self._transfer_lock:
-                with peer.transfer_req_lock:
+            # See ``batched_read`` for the locking rationale: ack-wait must
+            # happen WITHOUT ``_transfer_lock`` so the listener side can
+            # service symmetric peer reads concurrently.
+            with peer.transfer_req_lock:
+                with self._transfer_lock:
                     peer.transfer_req_socket.send(msgspec.msgpack.encode(req))
                     self.agent.recv_batch(
                         peer.conn_handle, ops, self.transport_stream.npu_stream
                     )
-                    ack_bytes = self._wait_for_transfer_ack(peer)
-                ack = msgspec.msgpack.decode(ack_bytes, type=PingPongMsg)
-                self._raise_on_ack_failure(ack)
-                # Success: drain our stream so the user buffer is populated
-                # by the time this coroutine resumes. Done under
-                # _transfer_lock so no other transfer queues ops on this
-                # stream during the drain.
-                self.transport_stream.synchronize()
+                ack_bytes = self._wait_for_transfer_ack(peer)
+            ack = msgspec.msgpack.decode(ack_bytes, type=PingPongMsg)
+            self._raise_on_ack_failure(ack)
+            # Success: drain our stream so the user buffer is populated
+            # by the time this coroutine resumes. Listener-side send_batch
+            # lives on ``_send_stream``, so no cross-direction FIFO
+            # interference here (see ``__init__`` for the stream split
+            # rationale).
+            self.transport_stream.synchronize()
             return len(buffers)
 
         return await loop.run_in_executor(None, _run_blocking)
@@ -1096,22 +1202,30 @@ class HcclPingPongChannel(BaseTransferChannel):
             for addr, size in zip(local_dst_addrs, sizes, strict=True)
         ]
 
-        with self._transfer_lock:
-            with peer.transfer_req_lock:
+        # See ``batched_read`` for the full locking rationale. The event
+        # is recorded under ``_transfer_lock`` so it captures exactly our
+        # queued recv ops (listener-side ``send_batch`` lives on
+        # ``_send_stream`` and cannot race onto this stream — the lock
+        # only protects shared ``agent`` state during submission). The
+        # ack wait must happen WITHOUT ``_transfer_lock`` to avoid the
+        # bidirectional pull deadlock against symmetric peer reads.
+        with peer.transfer_req_lock:
+            with self._transfer_lock:
                 peer.transfer_req_socket.send(msgspec.msgpack.encode(req))
                 self.agent.recv_batch(
                     peer.conn_handle, ops, self.transport_stream.npu_stream
                 )
-                ack_bytes = self._wait_for_transfer_ack(peer)
-            ack = msgspec.msgpack.decode(ack_bytes, type=PingPongMsg)
-            self._raise_on_ack_failure(ack)
-            # Happy path: the sender has already synchronized its own stream
-            # before sending ``ok=True``, so every ``sendDoneSlot`` notify
-            # is on the wire and our queued ``recv_batch`` waits will clear
-            # in microseconds. Record an event the caller can wait on
-            # instead of blocking the current thread on ``synchronize()``.
-            event = torch.npu.Event()
-            event.record(self.transport_stream)
+                # Happy path: the sender has already synchronized its own
+                # stream before sending ``ok=True``, so every
+                # ``sendDoneSlot`` notify is on the wire and our queued
+                # ``recv_batch`` waits will clear in microseconds. Record
+                # an event the caller can wait on instead of blocking the
+                # current thread on ``synchronize()``.
+                event = torch.npu.Event()
+                event.record(self.transport_stream)
+            ack_bytes = self._wait_for_transfer_ack(peer)
+        ack = msgspec.msgpack.decode(ack_bytes, type=PingPongMsg)
+        self._raise_on_ack_failure(ack)
         return event
 
     @staticmethod
@@ -1228,7 +1342,11 @@ class HcclPingPongChannel(BaseTransferChannel):
         assert transfer_spec is not None
         if not scatter_entries:
             return 0
-        peer = self._await_peer_ready(transfer_spec[TS_RECEIVER_ID])
+        # We are the receiver here, scatter-pulling from a remote sender we
+        # initiated to — connector role.
+        peer = self._await_peer_ready(
+            transfer_spec[TS_RECEIVER_ID], role="connector"
+        )
         receiver_id = self._infer_receiver_id_for_request(transfer_spec)
 
         wire_entries: List[PingPongScatterEntryMsg] = []
@@ -1271,21 +1389,25 @@ class HcclPingPongChannel(BaseTransferChannel):
             # Set the NPU device on the executor worker thread; see the
             # equivalent comment in async_batched_read for the rationale.
             torch.npu.set_device(self.handle_device)
-            with self._transfer_lock:
-                with peer.transfer_req_lock:
+            # See ``batched_read`` for the locking rationale: ack-wait must
+            # happen WITHOUT ``_transfer_lock`` so the listener side can
+            # service symmetric peer reads concurrently.
+            with peer.transfer_req_lock:
+                with self._transfer_lock:
                     peer.transfer_req_socket.send(msgspec.msgpack.encode(req))
                     self.agent.scatter_recv(
                         peer.conn_handle,
                         cpp_recv_entries,
                         self.transport_stream.npu_stream,
                     )
-                    ack_bytes = self._wait_for_transfer_ack(peer)
-                ack = msgspec.msgpack.decode(ack_bytes, type=PingPongMsg)
-                self._raise_on_ack_failure(ack)
-                # Success: drain stream so dst_addrs are populated when the
-                # coroutine resumes. See async_batched_read for the
-                # locking rationale.
-                self.transport_stream.synchronize()
+                ack_bytes = self._wait_for_transfer_ack(peer)
+            ack = msgspec.msgpack.decode(ack_bytes, type=PingPongMsg)
+            self._raise_on_ack_failure(ack)
+            # Success: drain stream so dst_addrs are populated when the
+            # coroutine resumes. Listener-side scatter_send lives on
+            # ``_send_stream`` (see ``__init__``), so no cross-direction
+            # FIFO interference on this stream.
+            self.transport_stream.synchronize()
             return total_count
 
         return await loop.run_in_executor(None, _run_blocking)
@@ -1298,13 +1420,17 @@ class HcclPingPongChannel(BaseTransferChannel):
         for thread in self.running_threads:
             thread.join(timeout=2.0)
         with self._state_lock:
-            for peer in self._peers.values():
+            # Only the connector dict owns transfer_req_sockets; the
+            # listener dict's entries always have ``transfer_req_socket=None``
+            # so iterating it just to clear() is fine.
+            for peer in self._connector_peers.values():
                 if peer.transfer_req_socket is not None:
                     try:
                         peer.transfer_req_socket.close()
                     except Exception:
                         pass
-            self._peers.clear()
+            self._connector_peers.clear()
+            self._listener_peers.clear()
         for sock in self.side_channels:
             try:
                 sock.close()

@@ -282,6 +282,15 @@ class HcclPingPongChannel(BaseTransferChannel):
         # is the simplest way to keep both peer states alive simultaneously.
         self._connector_peers: Dict[str, _PeerState] = {}
         self._listener_peers: Dict[str, _PeerState] = {}
+        # Per-peer handshake serialization for the async path. Mirrors the
+        # treatment ``HcclChannel`` got via PR #234: with the p2p_sync
+        # ``batched_get_blocking`` path fanning blocking ``ensure_peer_connection``
+        # hops onto the P2P loop, several coroutines can race the
+        # ``_connector_peers`` check for the same peer, double-fire the init
+        # handshake, and call ``self.agent.connect`` twice on the same NPU
+        # device. A per-peer ``asyncio.Lock`` keeps each peer's handshake to
+        # one in-flight coroutine without blocking other peers.
+        self._peer_handshake_locks: Dict[str, asyncio.Lock] = {}
         self.side_channels: List[zmq.Socket] = []
         self.running_threads: List[threading.Thread] = []
 
@@ -509,7 +518,37 @@ class HcclPingPongChannel(BaseTransferChannel):
         finally:
             init_tmp_socket.close()
 
+    def _get_peer_handshake_lock(self, peer_id: str) -> asyncio.Lock:
+        # The lock dict itself only mutates on the loop thread (every caller
+        # of ``async_lazy_init_peer_connection`` already runs on the P2P
+        # loop), so a plain check/insert is safe without ``_state_lock``.
+        lock = self._peer_handshake_locks.get(peer_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._peer_handshake_locks[peer_id] = lock
+        return lock
+
     async def async_lazy_init_peer_connection(
+        self,
+        local_id: str,
+        peer_id: str,
+        peer_init_url: str,
+        init_side_msg: Optional[InitSideMsgBase] = None,
+    ) -> Optional[InitSideRetMsgBase]:
+        # Serialize per-peer handshakes so concurrent ``_ensure_peer_connection``
+        # fan-out (notably from the new sync ``batched_get_blocking`` bridge
+        # in ``AscendP2PBackend``) cannot race the ``_connector_peers`` check
+        # and call ``self.agent.connect`` twice on the same NPU device.
+        # Mirrors ``HcclChannel.async_lazy_init_peer_connection`` (PR #234).
+        async with self._get_peer_handshake_lock(peer_id):
+            return await self._async_lazy_init_peer_connection_locked(
+                local_id,
+                peer_id,
+                peer_init_url,
+                init_side_msg,
+            )
+
+    async def _async_lazy_init_peer_connection_locked(
         self,
         local_id: str,
         peer_id: str,

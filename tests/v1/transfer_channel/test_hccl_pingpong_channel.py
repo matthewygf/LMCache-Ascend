@@ -1465,3 +1465,97 @@ def test_pingpong_handle_read_releases_transfer_lock_before_synchronize(monkeypa
         "concurrent recv_batch acquisition and re-creates the bidirectional "
         "deadlock the stream split was meant to break."
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-peer handshake serialization (NPU-free)
+#
+# After the p2p_sync rebase, ``AscendP2PBackend.batched_get_blocking`` bridges
+# sync callers onto the P2P loop via ``_run_coroutine_threadsafe_blocking``
+# and fans out ``_ensure_peer_connection`` for the same peer from several
+# coroutines. Without a per-peer ``asyncio.Lock``, two of those coroutines
+# can both see ``peer_id not in _connector_peers`` and double-fire the init
+# handshake -> ``self.agent.connect`` on the same NPU device. Mirrors the
+# fix PR #234 already applied to ``HcclChannel``.
+# ---------------------------------------------------------------------------
+
+
+def test_pingpong_get_peer_handshake_lock_returns_same_lock_per_peer():
+    """Repeated calls for the same peer return one shared asyncio.Lock,
+    distinct peers get distinct locks."""
+    # First Party
+    from lmcache_ascend.v1.transfer_channel.hccl_pingpong_channel import (
+        HcclPingPongChannel,
+    )
+
+    chan = HcclPingPongChannel.__new__(HcclPingPongChannel)
+    chan._peer_handshake_locks = {}
+
+    lock_a1 = chan._get_peer_handshake_lock("peer_a")
+    lock_a2 = chan._get_peer_handshake_lock("peer_a")
+    lock_b = chan._get_peer_handshake_lock("peer_b")
+
+    assert isinstance(lock_a1, asyncio.Lock)
+    assert lock_a1 is lock_a2
+    assert lock_a1 is not lock_b
+
+
+def test_pingpong_async_lazy_init_serializes_per_peer_handshakes():
+    """Two concurrent ``async_lazy_init_peer_connection`` calls for the same
+    peer must run their inner ``_async_lazy_init_peer_connection_locked``
+    bodies one-at-a-time; calls for different peers must overlap freely."""
+    # First Party
+    from lmcache_ascend.v1.transfer_channel.hccl_pingpong_channel import (
+        HcclPingPongChannel,
+    )
+
+    chan = HcclPingPongChannel.__new__(HcclPingPongChannel)
+    chan._peer_handshake_locks = {}
+
+    in_flight: Dict[str, int] = {}
+    peak: Dict[str, int] = {}
+
+    async def fake_locked(
+        local_id, peer_id, peer_init_url, init_side_msg=None
+    ):
+        in_flight[peer_id] = in_flight.get(peer_id, 0) + 1
+        peak[peer_id] = max(peak.get(peer_id, 0), in_flight[peer_id])
+        # Yield twice so a sibling coroutine for the same peer gets a real
+        # chance to enter without the lock if serialization is broken.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        in_flight[peer_id] -= 1
+        return None
+
+    chan._async_lazy_init_peer_connection_locked = fake_locked
+
+    async def run():
+        await asyncio.gather(
+            HcclPingPongChannel.async_lazy_init_peer_connection(
+                chan, "me", "peer_a", "url_a", None
+            ),
+            HcclPingPongChannel.async_lazy_init_peer_connection(
+                chan, "me", "peer_a", "url_a", None
+            ),
+            HcclPingPongChannel.async_lazy_init_peer_connection(
+                chan, "me", "peer_b", "url_b", None
+            ),
+            HcclPingPongChannel.async_lazy_init_peer_connection(
+                chan, "me", "peer_b", "url_b", None
+            ),
+        )
+
+    asyncio.run(run())
+
+    assert peak.get("peer_a", 0) == 1, (
+        "REGRESSION: two coroutines entered "
+        "_async_lazy_init_peer_connection_locked for peer_a concurrently; "
+        "per-peer handshake lock is missing or not held across the inner "
+        "call."
+    )
+    assert peak.get("peer_b", 0) == 1, (
+        "Same regression as above, observed via peer_b."
+    )
+    # Sanity: both peers were actually exercised (avoids a vacuously passing
+    # test if the wiring drops calls entirely).
+    assert "peer_a" in peak and "peer_b" in peak

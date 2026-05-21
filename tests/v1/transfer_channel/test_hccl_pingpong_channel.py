@@ -873,8 +873,9 @@ def test_pingpong_submit_batched_read(
 
 
 """
-Async scatter from a host-resident contiguous buffer on the sender to per-page NPU destinations
-on the receiver. Validates the H2D-only v1 of BatchChannel.ScatterSend end-to-end.
+Async scatter from a host-resident contiguous buffer on the sender to per-page
+NPU destinations on the receiver. Validates the H2D-only v1 of
+BatchChannel.ScatterSend end-to-end.
 """
 @pytest.mark.skipif(
     not torch.npu.is_available() or torch.npu.device_count() < 2,
@@ -1104,7 +1105,6 @@ def test_pingpong_transfer_lock_released_during_ack_wait():
 
     # First Party
     from lmcache_ascend.v1.transfer_channel.hccl_pingpong_channel import (
-        HcclPingPongChannel,
         _PeerState,
     )
     from lmcache_ascend.v1.transfer_channel.hccl_pingpong_protocol import (

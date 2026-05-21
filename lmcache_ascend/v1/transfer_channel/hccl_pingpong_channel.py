@@ -505,7 +505,8 @@ class HcclPingPongChannel(BaseTransferChannel):
             resp = msgspec.msgpack.decode(resp_bytes, type=PingPongMsg)
             if not isinstance(resp, PingPongInitResponse) or not resp.server_meta_bytes:
                 raise ConnectionError(
-                    f"PingPong init handshake failed for peer {peer_id}: {type(resp).__name__}"
+                    f"PingPong init handshake failed for peer {peer_id}: "
+                    f"{type(resp).__name__}"
                 )
             server_meta = pickle.loads(resp.server_meta_bytes)
 
@@ -586,7 +587,8 @@ class HcclPingPongChannel(BaseTransferChannel):
             resp = msgspec.msgpack.decode(resp_bytes, type=PingPongMsg)
             if not isinstance(resp, PingPongInitResponse) or not resp.server_meta_bytes:
                 raise ConnectionError(
-                    f"PingPong init handshake failed for peer {peer_id}: {type(resp).__name__}"
+                    f"PingPong init handshake failed for peer {peer_id}: "
+                    f"{type(resp).__name__}"
                 )
             server_meta = pickle.loads(resp.server_meta_bytes)
 
@@ -840,8 +842,8 @@ class HcclPingPongChannel(BaseTransferChannel):
             except Exception as e:
                 logger.error("PingPong transfer dispatch failure: %s", e)
                 if isinstance(req, PingPongScatterRequest):
-                    ack: Union[PingPongReadAck, PingPongScatterAck] = PingPongScatterAck(
-                        ok=False, error=str(e)
+                    ack: Union[PingPongReadAck, PingPongScatterAck] = (
+                        PingPongScatterAck(ok=False, error=str(e))
                     )
                 else:
                     ack = PingPongReadAck(ok=False, error=str(e))

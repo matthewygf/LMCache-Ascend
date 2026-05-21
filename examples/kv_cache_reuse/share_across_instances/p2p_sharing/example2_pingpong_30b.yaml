@@ -16,7 +16,7 @@ use_layerwise: False
 # queries the controller for cross-instance peer locations is
 # `storage_manager.async_lookup_and_prefetch` -> `batched_async_contains`,
 # which is gated on this flag.
-enable_async_loading: True
+enable_async_loading: False # TODO: revert to True if want async (old)
 
 # P2P configurations
 enable_p2p: True

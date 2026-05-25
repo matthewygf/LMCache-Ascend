@@ -10,6 +10,7 @@ import mindspore as ms
 
 # First Party
 import lmcache_ascend.c_ops as lmc_ops
+from lmcache_ascend.v1.system_detection import _get_socket_numa_mask
 
 logger = init_logger(__name__)
 
@@ -17,6 +18,9 @@ logger = init_logger(__name__)
 def _read_from_sys() -> Optional[NUMAMapping]:
     """
     Read NUMA mapping from system configuration.
+    Returns a NUMAMapping where the value is a bitmask of NUMA nodes
+    on the same physical socket as the device, enabling memory allocations
+    across all local NUMA nodes.
     """
 
     try:
@@ -31,7 +35,8 @@ def _read_from_sys() -> Optional[NUMAMapping]:
         # Sanitizing the output as on some hardware setups the numa_node variable
         # appeared to return with -1 value, causing failure.
         if numa_node >= 0:
-            return NUMAMapping(gpu_to_numa_mapping={device_index: numa_node})
+            numa_mask = _get_socket_numa_mask(numa_node)
+            return NUMAMapping(gpu_to_numa_mapping={device_index: numa_mask})
         else:
             logger.warning("No valid NUMA mapping for current device, returning None")
             return None

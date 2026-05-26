@@ -179,6 +179,17 @@ class HcclPingPongChannel(BaseTransferChannel):
 
     _channel_name = "hccl_pingpong"
 
+    # Set once per process the first time any pingpong transfer observes an
+    # ``ok=False`` ack. After that point every subsequent ``recv_batch`` /
+    # ``scatter_recv`` on this device queues behind ~10s of phantom
+    # ``Wait`` drain per chunk (see the poisoned-streams note in
+    # ``_wait_for_transfer_ack`` and ``para.timeout`` in
+    # ``csrc/hccl_pingpong/batch_channel.cc``). Flipping this flag from
+    # the puller / sender hot path produces one loud, easy-to-grep marker
+    # in the worker logs so the operator can correlate cascade timeouts
+    # against their underlying trigger.
+    _poisoned_flag_logged: bool = False
+
     def __init__(
         self,
         async_mode: bool = False,
@@ -866,7 +877,22 @@ class HcclPingPongChannel(BaseTransferChannel):
         # We are the sender side here — the receiver (req.receiver_id)
         # initiated the BatchChannel handshake to us, so its peer entry
         # lives in the listener registry.
-        peer = self._await_peer_ready(req.receiver_id, role="listener")
+        t0 = time.monotonic()
+        n_chunks = len(req.sender_local_addrs)
+        try:
+            peer = self._await_peer_ready(req.receiver_id, role="listener")
+        except Exception as e:
+            logger.error(
+                "PingPong sender: _await_peer_ready FAILED receiver_id=%s "
+                "chunks=%d await_ms=%.1f exc=%r. ok=False will be sent - "
+                "receiver stream will be POISONED on its device.",
+                req.receiver_id,
+                n_chunks,
+                (time.monotonic() - t0) * 1000,
+                e,
+            )
+            raise
+        t1 = time.monotonic()
         conn_handle = peer.conn_handle
 
         ops = [
@@ -883,14 +909,47 @@ class HcclPingPongChannel(BaseTransferChannel):
         # acquiring it to issue a concurrent ``recv_batch``, defeating
         # half the point of splitting send/recv onto separate streams.
         with self._transfer_lock:
-            self.agent.send_batch(
-                conn_handle, ops, self._send_stream.npu_stream
-            )
+            t2 = time.monotonic()
+            try:
+                self.agent.send_batch(
+                    conn_handle, ops, self._send_stream.npu_stream
+                )
+            except Exception as e:
+                logger.error(
+                    "PingPong sender: agent.send_batch FAILED receiver_id=%s "
+                    "chunks=%d exc=%r. ok=False will be sent - receiver "
+                    "stream will be POISONED on its device.",
+                    req.receiver_id,
+                    n_chunks,
+                    e,
+                )
+                raise
+            t3 = time.monotonic()
         self._send_stream.synchronize()
+        t4 = time.monotonic()
+        self._maybe_log_sender_phases(
+            "read", req.receiver_id, n_chunks, t0, t1, t2, t3, t4
+        )
 
     def _handle_scatter_request(self, req: PingPongScatterRequest) -> None:
         # Sender side: see ``_handle_read_request`` for the role rationale.
-        peer = self._await_peer_ready(req.receiver_id, role="listener")
+        t0 = time.monotonic()
+        n_chunks = sum(len(e.counts) for e in req.entries)
+        try:
+            peer = self._await_peer_ready(req.receiver_id, role="listener")
+        except Exception as e:
+            logger.error(
+                "PingPong sender: _await_peer_ready FAILED (scatter) "
+                "receiver_id=%s chunks=%d await_ms=%.1f exc=%r. ok=False "
+                "will be sent - receiver stream will be POISONED on its "
+                "device.",
+                req.receiver_id,
+                n_chunks,
+                (time.monotonic() - t0) * 1000,
+                e,
+            )
+            raise
+        t1 = time.monotonic()
         conn_handle = peer.conn_handle
 
         entries = []
@@ -904,10 +963,28 @@ class HcclPingPongChannel(BaseTransferChannel):
 
         # See ``_handle_read_request`` for the lock/stream discipline.
         with self._transfer_lock:
-            self.agent.scatter_send(
-                conn_handle, entries, self._send_stream.npu_stream
-            )
+            t2 = time.monotonic()
+            try:
+                self.agent.scatter_send(
+                    conn_handle, entries, self._send_stream.npu_stream
+                )
+            except Exception as e:
+                logger.error(
+                    "PingPong sender: agent.scatter_send FAILED "
+                    "receiver_id=%s chunks=%d exc=%r. ok=False will be "
+                    "sent - receiver stream will be POISONED on its "
+                    "device.",
+                    req.receiver_id,
+                    n_chunks,
+                    e,
+                )
+                raise
+            t3 = time.monotonic()
         self._send_stream.synchronize()
+        t4 = time.monotonic()
+        self._maybe_log_sender_phases(
+            "scatter", req.receiver_id, n_chunks, t0, t1, t2, t3, t4
+        )
 
     # ------------------------------------------------------------------
     # Local helpers
@@ -1113,22 +1190,32 @@ class HcclPingPongChannel(BaseTransferChannel):
         # ``PingPongReadRequest`` from the symmetric peer, and under DP
         # bidirectional cross-rank pulls A and B mutually deadlock waiting
         # for each other's ack.
+        t0 = time.monotonic()
+        n_chunks = len(ops)
         with peer.transfer_req_lock:
+            t1 = time.monotonic()
             with self._transfer_lock:
+                t2 = time.monotonic()
                 peer.transfer_req_socket.send(msgspec.msgpack.encode(req))
+                t3 = time.monotonic()
                 # Submit the local recv concurrently with the remote send so
                 # ping-pong wraparound (which needs receiver-side recvReady
                 # credits) can make progress.
                 self.agent.recv_batch(
                     peer.conn_handle, ops, self.transport_stream.npu_stream
                 )
+                t4 = time.monotonic()
             # NOBLOCK-poll the REQ socket. We must NOT pre-emptively
             # synchronize() the stream here -- if the sender rejects the
             # request it will never post the matching sendDoneSlot
             # notifies and synchronize() would deadlock. The poll runs
             # WITHOUT _transfer_lock so the listener side stays responsive.
             ack_bytes = self._wait_for_transfer_ack(peer)
+            t5 = time.monotonic()
         ack = msgspec.msgpack.decode(ack_bytes, type=PingPongMsg)
+        self._maybe_log_ack_failure(
+            ack, peer, n_chunks, "batched_read", t0, t1, t2, t3, t4, t5
+        )
         # Raises on ok=False, leaving the stream queue intact for the
         # HCCL transport timeout to drain (see poisoned-streams note in
         # _wait_for_transfer_ack).
@@ -1141,7 +1228,13 @@ class HcclPingPongChannel(BaseTransferChannel):
         # send_batch lives on ``_send_stream`` (NOT this stream), so
         # there is no cross-direction FIFO interference — see the
         # stream-split rationale in ``__init__``.
+        t6 = time.monotonic()
         self.transport_stream.synchronize()
+        t7 = time.monotonic()
+        self._maybe_log_transfer_phases(
+            "batched_read", peer, n_chunks,
+            t0, t1, t2, t3, t4, t5, t6, t7,
+        )
         return len(buffers)
 
     async def async_batched_read(
@@ -1180,21 +1273,38 @@ class HcclPingPongChannel(BaseTransferChannel):
             # See ``batched_read`` for the locking rationale: ack-wait must
             # happen WITHOUT ``_transfer_lock`` so the listener side can
             # service symmetric peer reads concurrently.
+            t0 = time.monotonic()
+            n_chunks = len(ops)
             with peer.transfer_req_lock:
+                t1 = time.monotonic()
                 with self._transfer_lock:
+                    t2 = time.monotonic()
                     peer.transfer_req_socket.send(msgspec.msgpack.encode(req))
+                    t3 = time.monotonic()
                     self.agent.recv_batch(
                         peer.conn_handle, ops, self.transport_stream.npu_stream
                     )
+                    t4 = time.monotonic()
                 ack_bytes = self._wait_for_transfer_ack(peer)
+                t5 = time.monotonic()
             ack = msgspec.msgpack.decode(ack_bytes, type=PingPongMsg)
+            self._maybe_log_ack_failure(
+                ack, peer, n_chunks, "async_batched_read",
+                t0, t1, t2, t3, t4, t5,
+            )
             self._raise_on_ack_failure(ack)
             # Success: drain our stream so the user buffer is populated
             # by the time this coroutine resumes. Listener-side send_batch
             # lives on ``_send_stream``, so no cross-direction FIFO
             # interference here (see ``__init__`` for the stream split
             # rationale).
+            t6 = time.monotonic()
             self.transport_stream.synchronize()
+            t7 = time.monotonic()
+            self._maybe_log_transfer_phases(
+                "async_batched_read", peer, n_chunks,
+                t0, t1, t2, t3, t4, t5, t6, t7,
+            )
             return len(buffers)
 
         return await loop.run_in_executor(None, _run_blocking)
@@ -1279,6 +1389,134 @@ class HcclPingPongChannel(BaseTransferChannel):
                 f"Unexpected transfer ack type: {type(ack).__name__}"
             )
 
+    # ------------------------------------------------------------------
+    # Diagnostic helpers (puller-side phase timing).
+    #
+    # These exist so the three transfer entry points (``batched_read``,
+    # ``async_batched_read``, ``async_batched_scatter``) emit logs in a
+    # uniform, greppable shape. They are deliberately log-only with no
+    # control-flow effect; the eventual fix plan keeps the
+    # poisoning-detected line and removes the rest once we've identified
+    # the trigger.
+    # ------------------------------------------------------------------
+    @classmethod
+    def _maybe_log_poisoning(
+        cls,
+        peer: _PeerState,
+        device_id: int,
+        ack_error: str,
+    ) -> None:
+        if cls._poisoned_flag_logged:
+            return
+        cls._poisoned_flag_logged = True
+        logger.error(
+            "PingPong: STREAM POISONING DETECTED on device %d (peer=%s). "
+            "First ok=False ack observed: %r. Every subsequent transfer on "
+            "this device will queue behind ~10s/chunk of phantom Wait drain "
+            "(see para.timeout in csrc/hccl_pingpong/batch_channel.cc) until "
+            "the device is reset. Expect cascading sync-get timeouts.",
+            device_id,
+            peer.transfer_url,
+            ack_error,
+        )
+
+    def _maybe_log_ack_failure(
+        self,
+        ack: PingPongMsg,
+        peer: _PeerState,
+        n_chunks: int,
+        op: str,
+        t0: float,
+        t1: float,
+        t2: float,
+        t3: float,
+        t4: float,
+        t5: float,
+    ) -> None:
+        if isinstance(ack, (PingPongReadAck, PingPongScatterAck)) and not ack.ok:
+            err = ack.error or "<no error>"
+            logger.error(
+                "PingPong puller %s ok=False peer=%s chunks=%d "
+                "phase_ms[lock1=%.1f lock2=%.1f zmq_send=%.1f recv_submit=%.1f "
+                "lock2_rel+ack_wait=%.1f] error=%r",
+                op,
+                peer.transfer_url,
+                n_chunks,
+                (t1 - t0) * 1000,
+                (t2 - t1) * 1000,
+                (t3 - t2) * 1000,
+                (t4 - t3) * 1000,
+                (t5 - t4) * 1000,
+                err,
+            )
+            self._maybe_log_poisoning(peer, self.handle_device, err)
+
+    @staticmethod
+    def _maybe_log_sender_phases(
+        op: str,
+        receiver_id: str,
+        n_chunks: int,
+        t0: float,
+        t1: float,
+        t2: float,
+        t3: float,
+        t4: float,
+    ) -> None:
+        total_ms = (t4 - t0) * 1000
+        # Same thresholds as the puller path. Healthy sends complete in
+        # microseconds; anything over 100ms total is worth surfacing.
+        if total_ms <= 100.0:
+            return
+        logger.warning(
+            "PingPong sender %s SLOW receiver_id=%s chunks=%d total_ms=%.1f "
+            "phase_ms[await=%.1f lock_acq=%.1f send_submit=%.1f sync=%.1f]",
+            op,
+            receiver_id,
+            n_chunks,
+            total_ms,
+            (t1 - t0) * 1000,
+            (t2 - t1) * 1000,
+            (t3 - t2) * 1000,
+            (t4 - t3) * 1000,
+        )
+
+    @staticmethod
+    def _maybe_log_transfer_phases(
+        op: str,
+        peer: _PeerState,
+        n_chunks: int,
+        t0: float,
+        t1: float,
+        t2: float,
+        t3: float,
+        t4: float,
+        t5: float,
+        t6: float,
+        t7: float,
+    ) -> None:
+        total_ms = (t7 - t0) * 1000
+        sync_ms = (t7 - t6) * 1000
+        # Skip the common fast path (sub-100ms total, sub-50ms sync).
+        # These bounds are intentionally tight so any cascade-triggering
+        # slowness surfaces while a healthy DP=8 ring stays quiet.
+        if total_ms <= 100.0 and sync_ms <= 50.0:
+            return
+        logger.warning(
+            "PingPong puller %s SLOW peer=%s chunks=%d total_ms=%.1f "
+            "phase_ms[lock1=%.1f lock2=%.1f zmq_send=%.1f recv_submit=%.1f "
+            "lock2_rel+ack_wait=%.1f sync=%.1f]",
+            op,
+            peer.transfer_url,
+            n_chunks,
+            total_ms,
+            (t1 - t0) * 1000,
+            (t2 - t1) * 1000,
+            (t3 - t2) * 1000,
+            (t4 - t3) * 1000,
+            (t5 - t4) * 1000,
+            sync_ms,
+        )
+
     def _wait_for_transfer_ack(
         self,
         peer: _PeerState,
@@ -1327,12 +1565,30 @@ class HcclPingPongChannel(BaseTransferChannel):
         time validation that can fail with a known peer in hand
         (e.g. unknown buffer uuid, out-of-range page index).
         """
-        deadline = time.time() + deadline_sec
-        while time.time() < deadline:
+        start = time.time()
+        deadline = start + deadline_sec
+        # Emit a WARNING heartbeat every 5s so a wedged sender no longer
+        # presents as a silent hang for up to ``_TRANSFER_ACK_TIMEOUT_SEC``
+        # (currently 10 minutes). Cheap because the heartbeat only fires on
+        # the slow path; healthy transfers return in microseconds.
+        next_heartbeat = start + 5.0
+        while True:
+            now = time.time()
+            if now >= deadline:
+                break
             try:
                 return peer.transfer_req_socket.recv(flags=zmq.NOBLOCK)
             except zmq.Again:
                 pass
+            if now >= next_heartbeat:
+                logger.warning(
+                    "PingPong: still waiting for transfer ack peer=%s "
+                    "elapsed=%.1fs deadline=%.1fs",
+                    peer.transfer_url,
+                    now - start,
+                    deadline_sec,
+                )
+                next_heartbeat = now + 5.0
             time.sleep(_ASYNC_EVENT_POLL_SEC)
         raise TimeoutError(
             f"PingPong: timed out waiting for transfer ack "
@@ -1433,22 +1689,39 @@ class HcclPingPongChannel(BaseTransferChannel):
             # See ``batched_read`` for the locking rationale: ack-wait must
             # happen WITHOUT ``_transfer_lock`` so the listener side can
             # service symmetric peer reads concurrently.
+            t0 = time.monotonic()
+            n_chunks = sum(len(e.counts) for e in cpp_recv_entries)
             with peer.transfer_req_lock:
+                t1 = time.monotonic()
                 with self._transfer_lock:
+                    t2 = time.monotonic()
                     peer.transfer_req_socket.send(msgspec.msgpack.encode(req))
+                    t3 = time.monotonic()
                     self.agent.scatter_recv(
                         peer.conn_handle,
                         cpp_recv_entries,
                         self.transport_stream.npu_stream,
                     )
+                    t4 = time.monotonic()
                 ack_bytes = self._wait_for_transfer_ack(peer)
+                t5 = time.monotonic()
             ack = msgspec.msgpack.decode(ack_bytes, type=PingPongMsg)
+            self._maybe_log_ack_failure(
+                ack, peer, n_chunks, "async_batched_scatter",
+                t0, t1, t2, t3, t4, t5,
+            )
             self._raise_on_ack_failure(ack)
             # Success: drain stream so dst_addrs are populated when the
             # coroutine resumes. Listener-side scatter_send lives on
             # ``_send_stream`` (see ``__init__``), so no cross-direction
             # FIFO interference on this stream.
+            t6 = time.monotonic()
             self.transport_stream.synchronize()
+            t7 = time.monotonic()
+            self._maybe_log_transfer_phases(
+                "async_batched_scatter", peer, n_chunks,
+                t0, t1, t2, t3, t4, t5, t6, t7,
+            )
             return total_count
 
         return await loop.run_in_executor(None, _run_blocking)

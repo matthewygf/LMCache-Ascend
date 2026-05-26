@@ -376,17 +376,37 @@ class AscendP2PBackend(P2PBackend):
         lookup_id: str,
         operation: str,
         unpin: bool,
+        timeout_at: Optional[float] = None,
     ) -> None:
+        # ``timeout_at`` is captured by ``_run_coroutine_threadsafe_blocking``
+        # at the instant the bridge gave up; the delta we log is the single
+        # most discriminating signal between a too-tight sync timeout
+        # (delta of a few seconds), a poisoned-stream drain (tens of
+        # seconds), and a genuinely wedged sender (~10 min ack timeout).
+        delta_s = (
+            (time.monotonic() - timeout_at) if timeout_at is not None else None
+        )
+        delta_str = "n/a" if delta_s is None else f"{delta_s:.1f}s"
         if future.cancelled():
+            logger.warning(
+                "Late sync P2P %s lookup_id=%s ended CANCELLED after %s. "
+                "Pre-allocated MemoryObjs may leak on this path - this is "
+                "the cascade the fix plan addresses.",
+                operation,
+                lookup_id,
+                delta_str,
+            )
             return
 
         try:
             result = future.result()
         except Exception as e:
-            logger.debug(
-                "Late sync P2P %s for lookup_id %s completed with error: %s",
+            logger.warning(
+                "Late sync P2P %s lookup_id=%s completed with error after "
+                "%s: %s",
                 operation,
                 lookup_id,
+                delta_str,
                 e,
             )
             return
@@ -395,10 +415,13 @@ class AscendP2PBackend(P2PBackend):
             mem_objs = [obj for obj in result if obj is not None]
             if mem_objs:
                 logger.warning(
-                    "Releasing %d late sync P2P %s result objects for lookup_id %s",
-                    len(mem_objs),
+                    "Late sync P2P %s lookup_id=%s succeeded %s after the "
+                    "bridge gave up - releasing %d MemObjs. Underlying "
+                    "transfer was healthy but slower than the sync timeout.",
                     operation,
                     lookup_id,
+                    delta_str,
+                    len(mem_objs),
                 )
                 release_memory_objects(mem_objs, unpin=unpin)
 
@@ -420,6 +443,18 @@ class AscendP2PBackend(P2PBackend):
         try:
             return future.result(timeout=self._sync_get_timeout_s)
         except TimeoutError:
+            timeout_at = time.monotonic()
+            logger.error(
+                "Sync P2P %s lookup_id=%s TIMEOUT after %.1fs "
+                "(future.done=%s future.running=%s). The background "
+                "coroutine keeps running; its result (if any) will be "
+                "released via _cleanup_late_sync_get_result.",
+                operation,
+                lookup_id,
+                self._sync_get_timeout_s,
+                future.done(),
+                future.running(),
+            )
             if cleanup_late_result:
                 future.add_done_callback(
                     lambda done: self._cleanup_late_sync_get_result(
@@ -427,6 +462,7 @@ class AscendP2PBackend(P2PBackend):
                         lookup_id,
                         operation,
                         unpin_late_result,
+                        timeout_at=timeout_at,
                     )
                 )
             future.cancel()

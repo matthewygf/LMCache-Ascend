@@ -121,6 +121,7 @@ def CreateTransferChannel(
 
     assert channel_type in [
         "hccl",
+        "hccl_onesided",
         "hccl_pingpong",
         "hixl",
         "hcomm_onesided",
@@ -150,6 +151,20 @@ def CreateTransferChannel(
         )
 
         return HcommOneSidedChannel(
+            async_mode=async_mode,
+            buffers=buffer_configs,
+            role=role,
+            tp_rank=tp_rank,
+            peer_init_url=peer_init_url,
+            **kwargs,
+        )
+    elif channel_type == "hccl_onesided":
+        # First Party
+        from lmcache_ascend.v1.transfer_channel.hccl_onesided_channel import (
+            HcclOneSidedChannel,
+        )
+
+        return HcclOneSidedChannel(
             async_mode=async_mode,
             buffers=buffer_configs,
             role=role,

@@ -44,6 +44,7 @@ TODO(high-concurrency hardening):
 """
 
 # Standard
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple, Union
 import asyncio
 import pickle
@@ -215,6 +216,13 @@ class HcclOneSidedChannel(BaseTransferChannel):
         if self._ack_timeout_sec <= 0:
             raise ValueError("os_ack_timeout_sec must be positive")
 
+        # Worker count for the dedicated handshake executors. Should be >= the
+        # number of peers that may handshake concurrently so connects/accepts
+        # never queue. Sized per pool (connect and accept get one each).
+        self._handshake_workers = int(kwargs.get("os_handshake_workers", 8))
+        if self._handshake_workers < 1:
+            raise ValueError("os_handshake_workers must be >= 1")
+
         self.agent = hos.OneSidedAgent.get_instance(self.handle_device)
         self.agent.init(cfg)
 
@@ -294,6 +302,23 @@ class HcclOneSidedChannel(BaseTransferChannel):
         # Dedicated non-default streams. Never use torch.npu.default_stream().
         self.transport_stream = torch.npu.Stream(torch.npu.current_device())
         self._send_stream = torch.npu.Stream(torch.npu.current_device())
+
+        # Dedicated handshake executors, isolated from the asyncio default
+        # executor (which carries blocking data-plane reads via
+        # ``async_batched_read``). connect() and the accept-start dispatch get
+        # SEPARATE pools on purpose: a pool full of blocked connects must never
+        # be able to starve the accepts that would unblock them — the "a node
+        # must always be able to accept while it is connecting" invariant from
+        # P2P_HANDSHAKE_FIX_PLAN.md §4.3. Keeping both off the default executor
+        # also means a data-plane read backlog cannot delay a handshake.
+        self._connect_pool = ThreadPoolExecutor(
+            max_workers=self._handshake_workers,
+            thread_name_prefix="os-hs-connect",
+        )
+        self._accept_pool = ThreadPoolExecutor(
+            max_workers=self._handshake_workers,
+            thread_name_prefix="os-hs-accept",
+        )
 
         self._init_side_channels()
         self._start_transfer_worker()
@@ -505,7 +530,9 @@ class HcclOneSidedChannel(BaseTransferChannel):
                 torch.npu.set_device(device)
                 return self.agent.connect(server_meta)
 
-            conn_handle = await loop.run_in_executor(None, _connect_blocking)
+            conn_handle = await loop.run_in_executor(
+                self._connect_pool, _connect_blocking
+            )
             self._register_peer(peer_id, conn_handle, resp)
 
             if init_side_msg is not None:
@@ -678,7 +705,9 @@ class HcclOneSidedChannel(BaseTransferChannel):
                 req = msgspec.msgpack.decode(
                     req_bytes, type=Union[OneSidedMsg, SideMsg]
                 )
-                resp = await loop.run_in_executor(None, self._handle_init_msg, req)
+                resp = await loop.run_in_executor(
+                    self._accept_pool, self._handle_init_msg, req
+                )
                 await sock.send(msgspec.msgpack.encode(resp))
             except Exception as e:
                 logger.error("OneSided async init loop failure: %s", e)
@@ -1415,6 +1444,19 @@ class HcclOneSidedChannel(BaseTransferChannel):
         self.running = False
         for thread in self.running_threads:
             thread.join(timeout=2.0)
+        # Drop queued handshakes and stop accepting new ones. Don't wait on
+        # in-flight connects/accepts: a connect can block on the socket
+        # rendezvous for up to the transport timeout, and close() must not hang
+        # that long. cancel_futures clears anything still queued.
+        for pool in (
+            getattr(self, "_connect_pool", None),
+            getattr(self, "_accept_pool", None),
+        ):
+            if pool is not None:
+                try:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
         with self._state_lock:
             for peer in self._connector_peers.values():
                 if peer.transfer_req_socket is not None:

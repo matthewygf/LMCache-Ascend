@@ -1347,6 +1347,203 @@ def test_onesided_receiver_failure_teardown_and_reconnect(num_objs):
 
 
 # ===========================================================================
+# Symmetric (DP2) bidirectional handshake repro
+#
+# Two peers connect to each other AT THE SAME TIME and then each pulls from the
+# other. This is the exact shape that wedged the regular ``hccl`` channel for
+# ~120s (see P2P_HANDSHAKE_FIX_PLAN.md §3/§4.4): both nodes initiate a connect
+# concurrently, so EACH agent must run ``connect`` (receiver role) and
+# ``accept`` (sender role) simultaneously. The one-sided agent gives every
+# connection its own NotifyPool and never holds its agent mutex across the
+# blocking handshake (csrc/hccl_onesided/onesided_agent.cpp), so this should NOT
+# deadlock. A regression toward a shared/serialized handshake engine surfaces
+# here as a process-join timeout.
+# ===========================================================================
+def symmetric_process(
+    config: OsChannelTestConfig, shared_dict: Dict[str, Any], idx: int
+) -> None:
+    try:
+        faulthandler.enable()
+        warnings.filterwarnings("ignore", message=".*torch.Tensor.cuda.*")
+        peer_idx = 1 - idx
+        my_dev = config.send_device_id if idx == 0 else config.recv_device_id
+        peer_dev = config.recv_device_id if idx == 0 else config.send_device_id
+        torch.npu.set_device(my_dev)
+        my_id = str(my_dev)
+        peer_id = str(peer_dev)
+
+        allocator = _get_allocator(my_dev, config.kv_shape, config.dtype)
+        align = _byte_size(config.kv_shape, config.dtype)
+
+        # Distinct value space per side so a cross-read is verifiable end to end.
+        # The data we SERVE to the peer (src_objs) and the buffers we READ INTO
+        # (dst_objs) MUST be different memory: reusing one buffer for both roles
+        # races the peer's RDMA read of our pages against our own copy-out into
+        # them. src_objs are the first num_objs allocations (pages 0..n-1), so
+        # the peer's TS_REMOTE_MEM_INDEXES=range(num_objs) resolves to them.
+        #
+        # Values must stay bf16-EXACT (|val| < 128 keeps the .5 mantissa bit),
+        # else verification fails on a perfectly correct transfer. Opposite
+        # signs per side make a cross-talk read (peer vs own buffer) unmissable.
+        sign = 1.0 if idx == 0 else -1.0
+        src_objs = []
+        expected = []
+        for i in range(config.num_objs):
+            obj = allocator.allocate(
+                torch.Size(config.kv_shape),
+                config.dtype,
+                fmt=MemoryFormat.KV_2LTD,
+                allocator_type="gpu",
+            )
+            val = sign * (float(i) + 0.5)
+            obj.tensor.fill_(val)
+            src_objs.append(obj)
+            expected.append(val)
+
+        dst_objs = []
+        for _ in range(config.num_objs):
+            obj = allocator.allocate(
+                torch.Size(config.kv_shape),
+                config.dtype,
+                fmt=MemoryFormat.KV_2LTD,
+                allocator_type="gpu",
+            )
+            obj.tensor.zero_()
+            dst_objs.append(obj)
+
+        # Separate port range (399x) from the one-directional tests (398x).
+        my_url = f"0.0.0.0:399{my_dev}"
+        channel = _make_channel(
+            "both",
+            my_dev,
+            allocator.gpu_allocator.buffer_ptr,
+            allocator.gpu_allocator.buffer_size,
+            align,
+            my_url,
+            my_id,
+            os_kwargs=_os_kwargs(config),
+        )
+
+        shared_dict[f"uuid_{idx}"] = channel.mem_handles[0].uuid
+        shared_dict[f"expected_{idx}"] = expected
+        shared_dict[f"init_{idx}"] = True
+
+        _wait_for(shared_dict, f"init_{peer_idx}", 30)
+        peer_uuid = shared_dict[f"uuid_{peer_idx}"]
+        peer_expected = list(shared_dict[f"expected_{peer_idx}"])
+        peer_url = f"127.0.0.1:399{peer_dev}"
+
+        # Rendezvous so BOTH sides call connect at (close to) the same instant:
+        # this maximizes the concurrent connect+accept overlap on each agent.
+        shared_dict[f"ready_{idx}"] = True
+        _wait_for(shared_dict, f"ready_{peer_idx}", 30)
+
+        channel.lazy_init_peer_connection(
+            local_id=my_id, peer_id=peer_id, peer_init_url=peer_url
+        )
+        assert peer_id in channel._connector_peers, (
+            "symmetric handshake did not register the connector peer"
+        )
+
+        transfer_spec = {
+            TS_RECEIVER_ID: peer_id,
+            TS_REMOTE_BUFFER_UUIDS: [peer_uuid] * config.num_objs,
+            TS_REMOTE_MEM_INDEXES: list(range(config.num_objs)),
+        }
+
+        for read_idx in range(config.num_reads):
+            n = channel.batched_read(dst_objs, transfer_spec)
+            assert n == config.num_objs
+            for i, obj in enumerate(dst_objs):
+                data = obj.tensor.cpu()
+                if not bool((data == peer_expected[i]).all()):
+                    sample = data.flatten()[:5].float().numpy()
+                    raise AssertionError(
+                        f"side {idx} read {read_idx} object {i}: "
+                        f"expected {peer_expected[i]}, got {sample}"
+                    )
+
+        logger.info(
+            "Symmetric side %d: verified %d objs x %d read(s) from peer %s",
+            idx,
+            config.num_objs,
+            config.num_reads,
+            peer_id,
+        )
+        shared_dict[f"done_{idx}"] = True
+        # Stay alive serving the peer's reads until it has finished too.
+        _wait_for(shared_dict, f"done_{peer_idx}", config.timeout)
+        time.sleep(0.2)
+        channel.close()
+    except Exception as e:
+        logger.error("Symmetric side %d failed: %s", idx, e)
+        # Unblock the peer even on failure so it does not hang to timeout.
+        shared_dict[f"done_{idx}"] = True
+        sys.exit(1)
+
+
+def _run_symmetric(config: OsChannelTestConfig) -> Dict[str, Any]:
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
+
+    with mp.Manager() as manager:
+        shared_dict = manager.dict()
+        procs = [
+            mp.Process(
+                target=symmetric_process,
+                args=(config, shared_dict, idx),
+                name=f"OsSym{idx}",
+            )
+            for idx in (0, 1)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=config.timeout)
+
+        errors = []
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+                errors.append(f"{proc.name} timed out (possible handshake deadlock)")
+            elif proc.exitcode != 0:
+                errors.append(f"{proc.name} failed with exitcode {proc.exitcode}")
+        result = dict(shared_dict)
+        if errors:
+            pytest.fail("\n".join(errors))
+    return result
+
+
+@pytest.mark.hardware
+@_SKIP
+@pytest.mark.parametrize(
+    "num_objs,num_reads",
+    [
+        (1, 1),  # minimal: one concurrent connect+accept per side
+        (4, 4),  # repeated pulls on the symmetric pair
+        (16, 2),  # slot reuse on top of the symmetric pair
+    ],
+)
+def test_onesided_symmetric_bidirectional_handshake(num_objs, num_reads):
+    """Both peers connect simultaneously, then each pulls from the other.
+
+    Regression guard for the DP2 stall: if the one-sided handshake ever becomes
+    serialized (so a node cannot ``accept`` while it is ``connect``-ing), this
+    test hangs and fails on the process-join timeout instead of passing.
+    """
+    _run_symmetric(
+        OsChannelTestConfig(
+            num_objs=num_objs,
+            num_reads=num_reads,
+            kv_shape=(4, 2, 8, 4, 16),
+            timeout=120,
+        )
+    )
+
+
+# ===========================================================================
 # Hardware throughput benchmark
 #
 # Quantifies the cost of the one-object-at-a-time staging protocol end to end.

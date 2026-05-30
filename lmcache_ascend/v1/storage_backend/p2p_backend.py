@@ -526,6 +526,7 @@ class AscendP2PBackend(P2PBackend):
             "os_sl",
             "os_timeout_sec",
             "os_ack_timeout_sec",
+            "os_handshake_workers",
             "os_transfer_bind_addr",
         )
         for key in os_keys:

@@ -45,9 +45,10 @@ TODO(high-concurrency hardening):
 
 # Standard
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 import asyncio
 import pickle
+import queue
 import threading
 import time
 
@@ -258,6 +259,13 @@ class HcclOneSidedChannel(BaseTransferChannel):
         self._connector_peers: dict[str, _PeerState] = {}
         self._listener_peers: dict[str, _PeerState] = {}
         self._peer_handshake_locks: dict[str, asyncio.Lock] = {}
+        # Invoked with the peer_id whenever a connector (receiver-side) peer is
+        # dropped from ``_connector_peers``. The owning backend uses it to evict
+        # its own "already connected" cache (target_peer_info_mapping) so the
+        # next lookup re-runs ensure_peer_connection -> re-handshake. Without
+        # this, the channel forgets the peer but the backend still thinks it is
+        # connected, so every later pull raises KeyError("Unknown peer ...").
+        self._on_connector_peer_torndown: Optional[Callable[[str], None]] = None
         # One staging region per agent, partitioned by slot range so symmetric
         # pulls can progress without corrupting local staging:
         #   [0, recv_slots)                      remote writes into us
@@ -324,9 +332,33 @@ class HcclOneSidedChannel(BaseTransferChannel):
             max_workers=self._handshake_workers,
             thread_name_prefix="os-hs-accept",
         )
+        # Stale-connection teardown (drain _send_stream + close_connection) on
+        # an old_peer replacement must NOT run inline in the serialized init
+        # accept path: a parked _send_stream there would block EVERY subsequent
+        # handshake to this node. Hand it to a dedicated recovery pool so the
+        # init loop can answer immediately.
+        self._recovery_pool = ThreadPoolExecutor(
+            max_workers=self._handshake_workers,
+            thread_name_prefix="os-recovery",
+        )
+
+        # decouple-ack: the _transfer_loop validates + ACKs a read request and
+        # then hands the actual staging/WriteAsync/Post enqueue to this single
+        # FIFO worker. Post/Wait/WriteAsync are stream-enqueue ops, so the only
+        # way the sender stalls is the ACL stream task queue filling (e.g. a
+        # Wait(consumed) for a dead receiver that never drains). Doing that
+        # enqueue here instead of inline keeps the _transfer_loop free to ACK
+        # every other peer, so a single stuck stream can no longer push healthy
+        # receivers past their ack timeout. One worker preserves global FIFO
+        # order, which is a superset of the per-peer ordering the receiver
+        # expects. ``None`` is the shutdown sentinel.
+        self._send_job_queue: "queue.Queue[Optional[Tuple[OneSidedReadRequest, _PeerState]]]" = (  # noqa: E501
+            queue.Queue()
+        )
 
         self._init_side_channels()
         self._start_transfer_worker()
+        self._start_send_worker()
 
     @staticmethod
     def _derive_equal_slots(num_slots: int, kwargs: dict) -> int:
@@ -381,6 +413,11 @@ class HcclOneSidedChannel(BaseTransferChannel):
 
     def _start_transfer_worker(self) -> None:
         t = threading.Thread(target=self._transfer_loop, daemon=True)
+        t.start()
+        self.running_threads.append(t)
+
+    def _start_send_worker(self) -> None:
+        t = threading.Thread(target=self._send_worker_loop, daemon=True)
         t.start()
         self.running_threads.append(t)
 
@@ -463,6 +500,18 @@ class HcclOneSidedChannel(BaseTransferChannel):
             return None
         finally:
             init_tmp_socket.close()
+
+    def set_connector_teardown_callback(
+        self, callback: Optional[Callable[[str], None]]
+    ) -> None:
+        """Register a hook fired when a connector peer is torn down.
+
+        The backend registers this so it can invalidate its own connection
+        cache and force a re-handshake on the next lookup. The callback runs on
+        whichever thread performed the teardown (transfer loop / recovery pool /
+        close), so it must be cheap and thread-safe.
+        """
+        self._on_connector_peer_torndown = callback
 
     def _get_peer_handshake_lock(self, peer_id: str) -> asyncio.Lock:
         lock = self._peer_handshake_locks.get(peer_id)
@@ -588,6 +637,35 @@ class HcclOneSidedChannel(BaseTransferChannel):
             send_slots=0,
         )
 
+    def _drain_and_close_stale_listener(self, conn_handle: int, local_id: str) -> None:
+        """Retire a replaced listener connection off the init accept path.
+
+        Runs on ``_recovery_pool`` so a parked ``_send_stream`` cannot block the
+        serialized init loop. The synchronize drains the old conn's enqueued
+        sends (bounded by the C++ transport timeout, ``os_timeout_sec``) before
+        ``close_connection``; both steps are guarded so a device error can't
+        kill the recovery worker. The replacement connection uses a different
+        conn_handle, so closing this one concurrently is safe.
+        """
+        torch.npu.set_device(self.handle_device)
+        try:
+            self._send_stream.synchronize()
+        except Exception as e:
+            logger.error(
+                "OneSided recovery: _send_stream.synchronize() failed while "
+                "retiring stale listener conn for %s: %s",
+                local_id,
+                e,
+            )
+        try:
+            self.agent.close_connection(conn_handle)
+        except Exception as e:
+            logger.warning(
+                "OneSided recovery: failed to close stale listener conn for %s: %s",
+                local_id,
+                e,
+            )
+
     def _handle_init_msg(
         self, req: Union[OneSidedMsg, InitSideMsgBase]
     ) -> Union[OneSidedMsg, InitSideRetMsgBase]:
@@ -613,21 +691,19 @@ class HcclOneSidedChannel(BaseTransferChannel):
                 # (e.g. the receiver tore down its end after a copy/drain error
                 # while our send succeeded, so we never ran _teardown_listener_
                 # peer). Drop the stale transport so the C++ conns_ map does not
-                # leak the old ConnState. Drain _send_stream first: an ok=True
-                # ack only means the writes/posts were ENQUEUED, so the old
-                # conn's ops may still be in flight here.
-                try:
-                    self._send_stream.synchronize()
-                except Exception:
-                    pass
-                try:
-                    self.agent.close_connection(old_peer.conn_handle)
-                except Exception as e:
-                    logger.warning(
-                        "OneSided: failed to close stale listener conn for %s: %s",
-                        local_id,
-                        e,
-                    )
+                # leak the old ConnState -- but do it OFF this thread. Draining
+                # _send_stream here (an ok=True ack only means the old conn's
+                # writes/posts were ENQUEUED) can block on a parked stream, and
+                # _async_init_loop processes inits serially, so a block here
+                # wedges every subsequent handshake to this node. Hand the
+                # drain+close to the recovery pool; the new connection uses a
+                # fresh conn_handle, so retiring the old one concurrently is
+                # safe.
+                self._recovery_pool.submit(
+                    self._drain_and_close_stale_listener,
+                    old_peer.conn_handle,
+                    local_id,
+                )
 
             accept_started = threading.Event()
 
@@ -738,29 +814,68 @@ class HcclOneSidedChannel(BaseTransferChannel):
                 continue
             except zmq.error.ContextTerminated:
                 break
-
-            try:
-                req = msgspec.msgpack.decode(req_bytes, type=OneSidedMsg)
-            except Exception as e:
-                logger.error("OneSided transfer decode failure: %s", e)
-                self._send_transfer_ack(
-                    sock, OneSidedReadAck(ok=False, error=f"decode_error:{e}")
-                )
-                continue
-
-            try:
-                if isinstance(req, OneSidedReadRequest):
-                    self._handle_read_request(req)
-                    self._send_transfer_ack(sock, OneSidedReadAck(ok=True))
-                else:
-                    raise ValueError(
-                        f"Unsupported transfer message: {type(req).__name__}"
-                    )
-            except Exception as e:
-                logger.error("OneSided transfer dispatch failure: %s", e)
-                self._send_transfer_ack(sock, OneSidedReadAck(ok=False, error=str(e)))
+            self._dispatch_transfer_message(sock, req_bytes)
 
         sock.close()
+
+    def _dispatch_transfer_message(self, sock: zmq.Socket, req_bytes: bytes) -> None:
+        """Validate + ACK a transfer request, then queue its device enqueue.
+
+        decouple-ack: the listener peer is resolved and the request validated
+        here (failures still reported as ok=False), the ACK is sent, and the
+        actual staging/WriteAsync/Post is handed to the send worker. The ACK no
+        longer waits on the (potentially stream-backpressured) enqueue, so one
+        stalled peer cannot time out every other receiver. Never raises: any
+        error becomes an ok=False ack.
+        """
+        try:
+            req = msgspec.msgpack.decode(req_bytes, type=OneSidedMsg)
+        except Exception as e:
+            logger.error("OneSided transfer decode failure: %s", e)
+            self._send_transfer_ack(
+                sock, OneSidedReadAck(ok=False, error=f"decode_error:{e}")
+            )
+            return
+
+        try:
+            if isinstance(req, OneSidedReadRequest):
+                peer = self._validate_read_request(req)
+                self._send_transfer_ack(sock, OneSidedReadAck(ok=True))
+                self._send_job_queue.put((req, peer))
+            else:
+                raise ValueError(f"Unsupported transfer message: {type(req).__name__}")
+        except Exception as e:
+            logger.error("OneSided transfer dispatch failure: %s", e)
+            self._send_transfer_ack(sock, OneSidedReadAck(ok=False, error=str(e)))
+
+    def _send_worker_loop(self) -> None:
+        """Drain queued read requests and run their device enqueue off-loop.
+
+        The ACK already went out in ``_transfer_loop``; this worker owns
+        ``_send_stream`` / ``_send_staging_lock`` / ``_send_inflight_event``
+        exclusively (single FIFO consumer), so the chained inflight-event
+        ordering stays correct. If the enqueue raises, ``_run_send_job`` has
+        already torn down the listener peer; the receiver then hits its
+        device-side ``data_ready`` wait timeout and recomputes.
+        """
+        torch.npu.set_device(self.handle_device)
+        while self.running:
+            try:
+                job = self._send_job_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if job is None:
+                break
+            req, peer = job
+            try:
+                self._run_send_job(req, peer)
+            except Exception as e:
+                logger.error(
+                    "OneSided send worker: enqueue failed for receiver %s "
+                    "(listener torn down; receiver will recompute): %s",
+                    req.receiver_id,
+                    e,
+                )
 
     @staticmethod
     def _send_transfer_ack(sock: zmq.Socket, ack: OneSidedReadAck) -> None:
@@ -1364,9 +1479,25 @@ class HcclOneSidedChannel(BaseTransferChannel):
             except Exception:
                 pass
             peer.transfer_req_socket = None
+        removed = False
         with self._state_lock:
             if self._connector_peers.get(peer_id) is peer:
                 del self._connector_peers[peer_id]
+                removed = True
+        # Tell the backend to drop its cached "connected" state so the next
+        # lookup re-handshakes this peer. Done outside the state lock and fully
+        # guarded: the callback crosses into the backend and must never turn a
+        # teardown into a crash.
+        if removed and self._on_connector_peer_torndown is not None:
+            try:
+                self._on_connector_peer_torndown(peer_id)
+            except Exception as e:
+                logger.error(
+                    "OneSided teardown: connector teardown callback failed for "
+                    "peer %s: %s",
+                    peer_id,
+                    e,
+                )
 
     def _teardown_listener_peer(self, peer_id: str, peer: _PeerState) -> None:
         """Tear down the sender end of a connection after a write failure.
@@ -1398,10 +1529,39 @@ class HcclOneSidedChannel(BaseTransferChannel):
             if self._listener_peers.get(peer_id) is peer:
                 del self._listener_peers[peer_id]
 
-    def _handle_read_request(self, req: OneSidedReadRequest) -> None:
+    def _validate_read_request(self, req: OneSidedReadRequest) -> _PeerState:
+        """Cheap, ACK-gating checks for an incoming read request.
+
+        Runs on ``_transfer_loop`` before the ACK, so it must stay fast: a
+        length check plus resolving the (already handshaked) listener peer.
+        Anything that raises here is reported to the receiver as ``ok=False``;
+        the heavier device enqueue is deferred to ``_run_send_job`` after the
+        ACK.
+        """
         if len(req.sender_local_addrs) != len(req.sizes):
             raise ValueError("OneSidedReadRequest addrs/sizes length mismatch")
-        peer = self._await_peer_ready(req.receiver_id, role="listener")
+        return self._await_peer_ready(req.receiver_id, role="listener")
+
+    def _handle_read_request(self, req: OneSidedReadRequest) -> None:
+        """Validate + enqueue a read request synchronously.
+
+        Production decouples these for the ACK: ``_transfer_loop`` calls
+        ``_validate_read_request`` (the ACK gate) and the send worker calls
+        ``_run_send_job`` (the device enqueue). This combined form is retained
+        for the host-only sender unit tests and any synchronous caller; note it
+        does NOT send an ACK (the socket layer owns that).
+        """
+        peer = self._validate_read_request(req)
+        self._run_send_job(req, peer)
+
+    def _run_send_job(self, req: OneSidedReadRequest, peer: _PeerState) -> None:
+        """Stage source pages, WriteAsync into the receiver, Post(data_ready).
+
+        Runs on the dedicated send worker (never the _transfer_loop), so a
+        full ACL stream task queue (e.g. a Wait(consumed) for a dead receiver)
+        back-pressures only this worker, not the ACKs. On error the listener
+        peer is torn down and the exception is re-raised for the worker to log.
+        """
         staging_base = self.agent.get_staging_base()
         enqueue_start = time.time()
 
@@ -1451,14 +1611,15 @@ class HcclOneSidedChannel(BaseTransferChannel):
                     self._send_inflight_event.record(self._send_stream)
             enqueue_elapsed = time.time() - enqueue_start
             if enqueue_elapsed >= _SLOW_ENQUEUE_WARN_SEC:
-                # The ack is only sent after this returns, so a slow enqueue is
-                # exactly what pushes the receiver toward its ack timeout. A
-                # device-side notify Wait hitting the C++ transport timeout
-                # back-pressures host enqueue and lands here.
+                # The ACK is now decoupled (sent before this enqueue), so a slow
+                # enqueue no longer trips the receiver ack timeout. It still
+                # means the ACL stream task queue is back-pressured -- typically
+                # a Wait(consumed) for a slow/dead receiver that is not draining
+                # -- which delays data delivery and grows the send-job queue.
                 logger.warning(
-                    "OneSided sender enqueue for peer %s took %.1fs across %d "
-                    "objects (ack is sent only after enqueue); receiver may be "
-                    "approaching its ack timeout.",
+                    "OneSided send worker: enqueue for peer %s took %.1fs across "
+                    "%d objects; the ACL stream is back-pressured (ACK already "
+                    "sent, so receivers are not failed, but delivery is delayed).",
                     req.receiver_id,
                     enqueue_elapsed,
                     len(req.sizes),
@@ -1473,6 +1634,14 @@ class HcclOneSidedChannel(BaseTransferChannel):
 
     def close(self) -> None:
         self.running = False
+        # Wake the send worker if it is parked on an empty queue so it can exit
+        # promptly instead of waiting out its get() timeout.
+        send_queue = getattr(self, "_send_job_queue", None)
+        if send_queue is not None:
+            try:
+                send_queue.put_nowait(None)
+            except Exception:
+                pass
         for thread in self.running_threads:
             thread.join(timeout=2.0)
         # Drop queued handshakes and stop accepting new ones. Don't wait on
@@ -1482,6 +1651,7 @@ class HcclOneSidedChannel(BaseTransferChannel):
         for pool in (
             getattr(self, "_connect_pool", None),
             getattr(self, "_accept_pool", None),
+            getattr(self, "_recovery_pool", None),
         ):
             if pool is not None:
                 try:

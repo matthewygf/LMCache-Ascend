@@ -1082,15 +1082,19 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                         **kwargs,
                     )
                     self._clear_proxy_batch(prev_batch)
-            except (TimeoutError, RuntimeError) as exc:
-                # A deferred P2P pull failed (ack timeout / torn channel). The
-                # channel has already torn down the poisoned peer inside
-                # submit_batched_read, so swallow here instead of letting the
-                # error propagate out of retrieve -> start_load_kv ->
-                # execute_model and kill the EngineCore. Record the req-id so
-                # the connector (vllm_v1_adapter) marks these blocks invalid and
-                # vLLM recomputes them locally. The finally below still releases
-                # buffers / sends Done so nothing leaks.
+            except Exception as exc:
+                # ANY deferred P2P pull failure must degrade to a local
+                # recompute rather than kill the EngineCore. This is broad on
+                # purpose: besides the ack TimeoutError / transfer RuntimeError,
+                # a peer torn down by a prior failure makes the next pull raise
+                # KeyError("Unknown peer ... role 'connector'") from
+                # _await_peer_ready, and other channel/device errors are
+                # possible too -- all of them should fall back, not crash. The
+                # channel tears the poisoned peer down inside
+                # submit_batched_read; we record the req-id so the connector
+                # (vllm_v1_adapter) marks these blocks invalid and vLLM
+                # recomputes them. The finally below still releases buffers /
+                # sends Done so nothing leaks. exc_info keeps real bugs visible.
                 req_id = kwargs.get("req_id")
                 logger.error(
                     "P2P pull failed for req %s (%s): %s; treating the "
@@ -1098,14 +1102,16 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     req_id,
                     type(exc).__name__,
                     exc,
+                    exc_info=True,
                 )
                 self._record_failed_load(req_id)
             finally:
-                # Guarantee ping-pong buffers are returned and the Done
-                # signal is sent even if the pipeline raises or
-                # allocate_buffers itself fails.  Without this, an
-                # exception would leak NPU pages and leave the sender's
-                # pinned resources stuck until its TTL expires.
+                # Host-drain before returning scratch buffers.  Keep the Done
+                # signal after this drain for correctness across channels:
+                # pingpong's ACK means the sender has synchronized its send
+                # stream, but onesided ACK is only a validation ACK and the
+                # sender may still be reading pinned source pages until our
+                # returned read event completes.
                 self.load_stream.synchronize()
                 if pool_a is not None:
                     first_ctx.release_buffers(pool_a)

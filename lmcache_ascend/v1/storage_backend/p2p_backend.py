@@ -183,11 +183,23 @@ class AscendP2PBackend(P2PBackend):
         # peer crashed and never sent the Done signal.
         self.pending_pull_resources: dict[str, tuple[float, list[MemoryObj]]] = {}
 
-        # TTL in seconds for pending_pull_resources entries.  If a peer
-        # crashes mid-pull and never sends the Done signal, pinned MemObjs
-        # are released after this timeout to prevent memory leaks.
+        # TTL in seconds for pending_pull_resources entries. In pull mode the
+        # sender pins the source KV at lookup and only releases it on the
+        # receiver's Done signal -- but under load that Done is exactly what
+        # fails first ("Failed to send P2P Done signal"), so this TTL is the
+        # real backstop. The old 360s default meant every failed/abandoned pull
+        # kept its source KV pinned for 6 minutes, which starves the local CPU
+        # cache pool and cascades into more failures. 60s reclaims ~6x faster.
+        #
+        # Safety floor: the TTL MUST exceed the longest a *healthy* pull can sit
+        # between pin (lookup) and the sender's WriteAsync completing, otherwise
+        # we could unpin source KV mid-read and corrupt it. A healthy pull is
+        # sub-second; the worst alive case is bounded by the receiver ack
+        # timeout (~30s) plus the HCCL transport timeout (~10s), so 60s keeps a
+        # safe margin while still reclaiming abandoned pulls promptly. Do not
+        # set this below the channel's os_ack_timeout_sec.
         self._pull_pending_ttl: float = config.get_extra_config_value(
-            "p2p_pull_pending_ttl", 360.0
+            "p2p_pull_pending_ttl", 60.0
         )
         self.p2p_done_timeout_s: float = config.get_extra_config_value(
             "p2p_done_timeout_s", 5.0
@@ -301,6 +313,18 @@ class AscendP2PBackend(P2PBackend):
             event_loop=self.loop,
             **channel_kwargs,
         )
+
+        # Keep the backend's "already connected" cache (target_peer_info_mapping)
+        # in sync with the channel. When the channel tears down a connector peer
+        # (read failure / ack timeout / poisoned transport) it forgets the peer,
+        # but the backend would still short-circuit ensure_peer_connection on the
+        # stale entry and then KeyError on the pull. Registering this hook makes
+        # the next lookup re-handshake instead.
+        register_teardown_cb = getattr(
+            self.transfer_channel, "set_connector_teardown_callback", None
+        )
+        if callable(register_teardown_cb):
+            register_teardown_cb(self._on_connector_peer_torndown)
 
         self.running = asyncio.Event()
         self.running.set()
@@ -496,6 +520,25 @@ class AscendP2PBackend(P2PBackend):
     ) -> None:
         await self._wait_for_async_context()
         await super()._ensure_peer_connection(target_peer_init_url, force_update)
+
+    def _on_connector_peer_torndown(self, peer_id: str) -> None:
+        """Drop cached connection state for a peer the channel just tore down.
+
+        Fired from the channel's teardown thread (transfer loop / recovery pool
+        / close), NOT the P2P event loop. The lookup coroutines index
+        ``target_peer_info_mapping`` directly on the loop, so schedule the pop
+        onto the loop to avoid racing them; popping here forces the next
+        ``ensure_peer_connection`` to re-handshake (the entry is gone, so it no
+        longer short-circuits) and the channel re-registers the peer.
+        """
+        try:
+            self.loop.call_soon_threadsafe(
+                self.target_peer_info_mapping.pop, peer_id, None
+            )
+        except RuntimeError:
+            # Loop is closed (shutdown in progress): no concurrent loop access,
+            # so a direct pop is safe and a stale entry no longer matters.
+            self.target_peer_info_mapping.pop(peer_id, None)
 
     def _collect_transfer_channel_kwargs(self, config: LMCacheEngineConfig) -> dict:
         """Pull optional transfer-channel tuning knobs from ``extra_config``.

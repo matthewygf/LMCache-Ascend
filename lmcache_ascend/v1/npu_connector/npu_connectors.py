@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Any, List, Optional, Set, Union
+import threading
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -443,6 +444,14 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         self.dsa_head_dim: int = 0
 
         super().__init__(hidden_dim_size, num_layers, use_gpu, **kwargs)
+
+        # Req-ids whose deferred P2P pull failed (timeout / torn channel) so the
+        # forward step can stay alive: the failure is swallowed here and the
+        # connector (vllm_v1_adapter) drains this set after start_load_kv to mark
+        # the affected blocks invalid, letting vLLM recompute them. Touched only
+        # from the forward thread today, but guarded for safety.
+        self._failed_load_req_ids: Set[str] = set()
+        self._failed_load_lock = threading.Lock()
 
         if is_310p():
             assert "num_kv_head" in kwargs, ("num_kv_head should be provided in 310p",)
@@ -908,6 +917,30 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                         self.to_gpu(memory_obj, start, end, **kwargs)
             self.load_stream.synchronize()
 
+    def _record_failed_load(self, req_id: Optional[str]) -> None:
+        """Mark a request's deferred P2P pull as failed (for recompute).
+
+        The req-id arrives via the retrieve ``kwargs`` forwarded into
+        ``batched_to_gpu``. If it is missing we still swallow the transfer
+        error (the engine must not die), but we cannot point vLLM at the
+        request to recompute -- log loudly so that gap is visible.
+        """
+        if not req_id:
+            logger.error(
+                "P2P pull failed but no req_id was threaded through "
+                "batched_to_gpu; cannot mark blocks invalid for recompute."
+            )
+            return
+        with self._failed_load_lock:
+            self._failed_load_req_ids.add(req_id)
+
+    def drain_failed_load_req_ids(self) -> Set[str]:
+        """Return and clear the req-ids whose P2P pull failed this step."""
+        with self._failed_load_lock:
+            failed = self._failed_load_req_ids
+            self._failed_load_req_ids = set()
+        return failed
+
     def _clear_proxy_batch(self, batch) -> None:
         """Clear the backing objects of the proxy batch."""
         for proxy, _, _ in batch:
@@ -1049,6 +1082,24 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                         **kwargs,
                     )
                     self._clear_proxy_batch(prev_batch)
+            except (TimeoutError, RuntimeError) as exc:
+                # A deferred P2P pull failed (ack timeout / torn channel). The
+                # channel has already torn down the poisoned peer inside
+                # submit_batched_read, so swallow here instead of letting the
+                # error propagate out of retrieve -> start_load_kv ->
+                # execute_model and kill the EngineCore. Record the req-id so
+                # the connector (vllm_v1_adapter) marks these blocks invalid and
+                # vLLM recomputes them locally. The finally below still releases
+                # buffers / sends Done so nothing leaks.
+                req_id = kwargs.get("req_id")
+                logger.error(
+                    "P2P pull failed for req %s (%s): %s; treating the "
+                    "request's KV as a cache miss for local recompute.",
+                    req_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                self._record_failed_load(req_id)
             finally:
                 # Guarantee ping-pong buffers are returned and the Done
                 # signal is sent even if the pipeline raises or

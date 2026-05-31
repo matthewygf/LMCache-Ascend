@@ -102,6 +102,11 @@ logger = init_logger(__name__)
 # clean error/teardown instead of wedging. Override via os_ack_timeout_sec.
 _DEFAULT_ACK_TIMEOUT_SEC = 30.0
 _ASYNC_EVENT_POLL_SEC = 0.001
+# Emit a one-shot diagnostic when an ack wait or a sender enqueue runs long
+# (well before the hard ack timeout fires), so a developing wedge is visible in
+# the logs instead of only surfacing as a fatal 30s timeout.
+_SLOW_ACK_WARN_SEC = 2.0
+_SLOW_ENQUEUE_WARN_SEC = 2.0
 
 
 class _RecvInflightDrainError(RuntimeError):
@@ -1296,10 +1301,21 @@ class HcclOneSidedChannel(BaseTransferChannel):
             deadline_sec = self._ack_timeout_sec
         start = time.time()
         deadline = start + deadline_sec
+        warn_after = start + min(_SLOW_ACK_WARN_SEC, deadline_sec / 2.0)
+        warned = False
         while time.time() < deadline:
             try:
                 return peer.transfer_req_socket.recv(flags=zmq.NOBLOCK)
             except zmq.Again:
+                if not warned and time.time() >= warn_after:
+                    warned = True
+                    logger.warning(
+                        "OneSided slow transfer ack: still waiting on the "
+                        "sender after %.1fs (hard timeout %.1fs); the sender "
+                        "_transfer_loop is likely back-pressured.",
+                        time.time() - start,
+                        deadline_sec,
+                    )
                 time.sleep(_ASYNC_EVENT_POLL_SEC)
         raise TimeoutError(
             f"OneSided timed out waiting for transfer ack after {deadline_sec}s"
@@ -1387,6 +1403,7 @@ class HcclOneSidedChannel(BaseTransferChannel):
             raise ValueError("OneSidedReadRequest addrs/sizes length mismatch")
         peer = self._await_peer_ready(req.receiver_id, role="listener")
         staging_base = self.agent.get_staging_base()
+        enqueue_start = time.time()
 
         try:
             with self._send_staging_lock:
@@ -1432,6 +1449,20 @@ class HcclOneSidedChannel(BaseTransferChannel):
                         peer.remote_dirty_slots.add(remote_slot)
                     self._send_inflight_event = torch.npu.Event()
                     self._send_inflight_event.record(self._send_stream)
+            enqueue_elapsed = time.time() - enqueue_start
+            if enqueue_elapsed >= _SLOW_ENQUEUE_WARN_SEC:
+                # The ack is only sent after this returns, so a slow enqueue is
+                # exactly what pushes the receiver toward its ack timeout. A
+                # device-side notify Wait hitting the C++ transport timeout
+                # back-pressures host enqueue and lands here.
+                logger.warning(
+                    "OneSided sender enqueue for peer %s took %.1fs across %d "
+                    "objects (ack is sent only after enqueue); receiver may be "
+                    "approaching its ack timeout.",
+                    req.receiver_id,
+                    enqueue_elapsed,
+                    len(req.sizes),
+                )
         except Exception:
             # Sender-side error: tear down so the next handshake rebuilds a
             # clean transport. The receiver observes ok=False and tears down

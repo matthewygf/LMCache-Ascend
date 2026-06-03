@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from typing import Any, List, Optional, Set, Union
+import os
 import threading
+import time
 
 # Third Party
 from lmcache.integration.vllm.utils import ENGINE_NAME
@@ -27,6 +29,12 @@ from lmcache_ascend.v1.transfer_context import AscendBaseTransferContext
 import lmcache_ascend.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+# Hot-path profiling for the delay-pull consumer (see p2p_backend env knobs).
+# These let us measure whether the worker thread is blocked inside an NPU
+# synchronize (which can hold the GIL and starve the P2P event loop).
+_NPU_PROFILE = os.environ.get("LMCACHE_P2P_PROFILE", "0") == "1"
+_NPU_SLOW_OP_WARN_S = float(os.environ.get("LMCACHE_P2P_SLOW_OP_WARN_S", "0.5"))
 
 _IS_310P = None
 
@@ -894,6 +902,32 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         # Check if any memory objects are ProxyMemoryObjs (deferred P2P fetch)
         has_proxy = any(isinstance(m, ProxyMemoryObj) for m in memory_objs)
 
+        # Diagnostic: make it unambiguous from the logs whether this retrieve is
+        # served from a *remote* one-sided pull (ProxyMemoryObj present) or from
+        # the *local* cache (real MemoryObjs only). On repeated identical prompts
+        # we expect REMOTE exactly once, then LOCAL -- a recurring REMOTE for the
+        # same req means the local write-back is not serving.
+        #
+        # stale_consumed_proxy is the smoking gun for the delay-pull cache bug:
+        # if a ProxyMemoryObj comes back already ``consumed``, it was written into
+        # LocalCPUBackend.hot_cache on a previous request (data-less), so this
+        # "local hit" is actually re-issuing a one-sided read against the
+        # sender's now-stale remote buffers instead of serving real local KV.
+        num_proxy = sum(1 for m in memory_objs if isinstance(m, ProxyMemoryObj))
+        num_stale_proxy = sum(
+            1 for m in memory_objs if isinstance(m, ProxyMemoryObj) and m.consumed
+        )
+        logger.info(
+            "batched_to_gpu: req_id=%s path=%s chunks=%d (proxy/remote=%d, "
+            "stale_consumed_proxy=%d, local=%d)",
+            kwargs.get("req_id"),
+            "REMOTE_PULL" if has_proxy else "LOCAL_ONLY",
+            len(memory_objs),
+            num_proxy,
+            num_stale_proxy,
+            len(memory_objs) - num_proxy,
+        )
+
         if has_proxy:
             assert not is_310p(), "Batched P2P transfer is not supported on 310P."
 
@@ -992,9 +1026,27 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
             # Get the transfer context for buffer allocation
             first_ctx = proxy_items[0][0].transfer_context
 
-            # Derive pipeline depth from NPU buffer capacity so that
-            # two full ping-pong pools fit in registered memory.
+            channel = proxy_items[0][0]._transfer_channel
+
+            # Derive pipeline depth from NPU buffer capacity so that two full
+            # ping-pong pools fit in registered memory, then honor a transfer
+            # channel cap if it exposes one. For hccl_onesided this avoids
+            # submitting a read larger than the receive staging ring.
             pipeline_depth = first_ctx.max_pipeline_depth
+            safe_submit_batch_size = getattr(channel, "safe_submit_batch_size", None)
+            if callable(safe_submit_batch_size):
+                safe_depth = safe_submit_batch_size()
+                if isinstance(safe_depth, int) and safe_depth > 0:
+                    capped_depth = min(pipeline_depth, safe_depth)
+                    if capped_depth < pipeline_depth:
+                        logger.info(
+                            "Capping P2P delay-pull pipeline depth from %d to %d "
+                            "for channel %s",
+                            pipeline_depth,
+                            capped_depth,
+                            type(channel).__name__,
+                        )
+                    pipeline_depth = capped_depth
             logger.debug(
                 "P2P pipeline depth = %d (proxy_items=%d)",
                 pipeline_depth,
@@ -1021,6 +1073,22 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     for i in range(0, len(proxy_items), pipeline_depth)
                 ]
 
+                # Each micro-batch becomes ONE submit_batched_read -> one
+                # OneSidedReadRequest -> one zmq req+ack round-trip on the
+                # sender. So a large pull bounded by a small pipeline_depth fans
+                # out into many small requests (the "chunks=5 x N" the sender
+                # logs). pipeline_depth here is min(buffer-derived depth,
+                # channel safe-submit); raising p2p_npu_buffer_size raises the
+                # buffer-derived depth and cuts the number of round-trips.
+                logger.info(
+                    "P2P delay-pull: req_id=%s proxy_chunks=%d pipeline_depth=%d "
+                    "=> %d one-sided requests (zmq round-trips) per TP rank",
+                    kwargs.get("req_id"),
+                    len(proxy_items),
+                    pipeline_depth,
+                    len(micro_batches),
+                )
+
                 prev_read_event = None
                 prev_batch = None
 
@@ -1028,7 +1096,6 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 # write into a pool from racing with a scatter that is
                 # still reading from the same pool on load_stream.
                 # Events are pre-allocated and re-recorded each iteration.
-                channel = proxy_items[0][0]._transfer_channel
                 transport_stream = getattr(channel, "transport_stream", None)
                 pool_scatter_events = [
                     torch.npu.Event(),
@@ -1055,7 +1122,26 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                     proxies = [item[0] for item in batch]
 
                     # Submit RDMA read for current batch → transport_stream.
+                    _t0 = time.perf_counter()
                     cur_read_event = ProxyMemoryObj.submit_resolve_batch(proxies)
+                    _sub = time.perf_counter() - _t0
+                    if _sub > _NPU_SLOW_OP_WARN_S:
+                        logger.warning(
+                            "P2P delay-pull submit_resolve_batch SLOW: %.0f ms "
+                            "(batch %d, %d proxies) -- the per-read zmq "
+                            "round-trip to the producer is the bottleneck.",
+                            _sub * 1000.0,
+                            batch_idx,
+                            len(proxies),
+                        )
+                    elif _NPU_PROFILE:
+                        logger.info(
+                            "P2P delay-pull submit_resolve_batch %.1f ms "
+                            "batch=%d proxies=%d",
+                            _sub * 1000.0,
+                            batch_idx,
+                            len(proxies),
+                        )
 
                     # While the current batch is being read on
                     # transport_stream, scatter the previous batch on
@@ -1112,7 +1198,24 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 # stream, but onesided ACK is only a validation ACK and the
                 # sender may still be reading pinned source pages until our
                 # returned read event completes.
+                _t0 = time.perf_counter()
                 self.load_stream.synchronize()
+                _sync = time.perf_counter() - _t0
+                if _sync > _NPU_SLOW_OP_WARN_S:
+                    logger.warning(
+                        "P2P delay-pull load_stream.synchronize() SLOW: %.0f "
+                        "ms for req %s. If the P2P loop also stalls in this "
+                        "window, this NPU sync is holding the GIL and starving "
+                        "the loop (the prime suspect).",
+                        _sync * 1000.0,
+                        kwargs.get("req_id"),
+                    )
+                elif _NPU_PROFILE:
+                    logger.info(
+                        "P2P delay-pull load_stream.synchronize() %.1f ms req=%s",
+                        _sync * 1000.0,
+                        kwargs.get("req_id"),
+                    )
                 if pool_a is not None:
                     first_ctx.release_buffers(pool_a)
                 if pool_b is not None:

@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Optional, Union
 import asyncio
+import os
 import pickle
 import threading
+import time
 
 # Third Party
 from lmcache.logging import init_logger
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObj,
+    MixedMemoryAllocator,
+)
 from lmcache.v1.rpc_utils import get_zmq_socket
 from lmcache.v1.transfer_channel.transfer_utils import (
     InitSideMsgBase,
@@ -25,12 +32,22 @@ import lmcache_ascend.hccl_npu_comms as hcomm
 from .base_channel import BaseMultiBufferChannel
 from .buffer_config import (
     BufferConfig,
+    BufferType,
     RemotePeerBufferList,
 )
 from .hccl_agent import HcclAgentWrapper
 from .transfer_spec import TS_RECEIVER_ID
 
 logger = init_logger(__name__)
+
+# Default host-staging arena size. Kept under the typical device registration
+# limit (~10 GiB); tune down via the ``os_staging_bytes`` extra_config knob if
+# registration fails on a given platform.
+_DEFAULT_STAGING_BYTES = 10 * 1024 * 1024 * 1024
+
+# Hot-path profiling for the staging copy (see p2p_backend for the env knobs).
+_STAGE_PROFILE = os.environ.get("LMCACHE_P2P_PROFILE", "0") == "1"
+_STAGE_SLOW_COPY_WARN_S = float(os.environ.get("LMCACHE_P2P_SLOW_OP_WARN_S", "0.5"))
 
 
 class HcclMsgBase(msgspec.Struct, tag=True):
@@ -99,14 +116,214 @@ class HcclChannel(BaseMultiBufferChannel):
         self._peer_ready_events: Dict[str, threading.Event] = {}
         self._peer_handshake_locks: Dict[str, asyncio.Lock] = {}
 
+        # --- Host-staging arena configuration (one-sided read source) ---
+        # When enabled the channel registers a small, bounded, pinned host
+        # arena instead of the (potentially >reg-limit) CPU KV pool, and
+        # serves one-sided reads out of staged copies. See
+        # docs/design/host_staging_onesided_channel.md.
+        self._use_host_staging: bool = bool(kwargs.pop("use_host_staging", False))
+        self._os_staging_bytes: int = int(
+            kwargs.pop("os_staging_bytes", _DEFAULT_STAGING_BYTES)
+        )
+        self._staging_shapes = kwargs.pop("staging_shapes", None)
+        self._staging_dtypes = kwargs.pop("staging_dtypes", None)
+        self._staging_fmt: MemoryFormat = kwargs.pop(
+            "staging_fmt", MemoryFormat.KV_2LTD
+        )
+        self._staging_arena: Optional[MixedMemoryAllocator] = None
+        self._staging_lock = threading.Lock()
+        self._os_staging_copy_threads: int = int(
+            kwargs.pop("os_staging_copy_threads", 32)
+        )
+        # Shared, bounded H2H copy pool: concurrent stagers share it instead of
+        # each spawning a private fan-out (which would oversubscribe the pinned
+        # NUMA node). torch._foreach_copy_ releases the GIL, so slices run in
+        # parallel even under torch.set_num_threads(1).
+        self._staging_copy_pool: Optional[ThreadPoolExecutor] = None
+        if self._use_host_staging and self._os_staging_copy_threads > 1:
+            self._staging_copy_pool = ThreadPoolExecutor(
+                max_workers=self._os_staging_copy_threads,
+                thread_name_prefix="lmc-staging-copy",
+            )
+
         super().__init__(async_mode=async_mode, buffers=buffers, **kwargs)
 
         self.transport_stream = torch.npu.Stream(self.handle_device)
 
     def _register_buffers(self, buffers: list[BufferConfig]) -> None:
+        if self._use_host_staging:
+            buffers = self._build_staging_buffers(buffers)
         self.hccl_wrapper = HcclAgentWrapper(buffers=buffers)
         self.hccl_agent = self.hccl_wrapper.agent
         self.mem_handles = self.hccl_wrapper.mem_handles
+
+    def _build_staging_buffers(self, buffers: list[BufferConfig]) -> list[BufferConfig]:
+        """Allocate the pinned staging arena and return the buffers to register.
+
+        With host staging the big CPU KV pool is *not* registered (that is the
+        whole point — it can exceed the device registration limit). Instead we
+        register a bounded pinned arena plus any non-CPU input buffers (the
+        reader-side ping-pong pool). The arena's page grid matches the chunk
+        page size so ``meta.address`` page indices resolve correctly on peers.
+        """
+        if self._staging_shapes is None or self._staging_dtypes is None:
+            raise ValueError(
+                "use_host_staging requires staging_shapes/staging_dtypes "
+                "(the KV chunk layout) to build the paged arena."
+            )
+
+        # chunk_bytes == get_size_bytes(shapes, dtypes) == CPU pool page size.
+        chunk_bytes = buffers[0].align_bytes
+        arena_bytes = (self._os_staging_bytes // chunk_bytes) * chunk_bytes
+        if arena_bytes < chunk_bytes:
+            raise ValueError(
+                f"os_staging_bytes ({self._os_staging_bytes}) is smaller than a "
+                f"single chunk ({chunk_bytes}); cannot stage any chunk."
+            )
+
+        # use_paging=True -> PagedTensorMemoryAllocator: pinned, one chunk per
+        # page, and meta.address == page index (required by resolve_addr).
+        self._staging_arena = MixedMemoryAllocator(
+            arena_bytes,
+            use_paging=True,
+            shapes=self._staging_shapes,
+            dtypes=self._staging_dtypes,
+            fmt=self._staging_fmt,
+        )
+        num_slots = arena_bytes // chunk_bytes
+        logger.info(
+            "Host-staging arena: %d bytes, %d slots x %d-byte chunks (pinned)",
+            arena_bytes,
+            num_slots,
+            chunk_bytes,
+        )
+
+        arena_cfg = BufferConfig(
+            ptr=self._staging_arena.buffer.data_ptr(),
+            size=arena_bytes,
+            device_id=buffers[0].device_id,
+            device_type=BufferType.CPU,
+            align_bytes=chunk_bytes,
+        )
+        # Register the arena + reader-side ping-pong (NPU) buffers, but NOT the
+        # big CPU pool (buffers[0]).
+        reg_buffers = [arena_cfg]
+        reg_buffers.extend(b for b in buffers if b.device_type != BufferType.CPU)
+        return reg_buffers
+
+    @property
+    def use_host_staging(self) -> bool:
+        return self._use_host_staging
+
+    async def stage(
+        self, mem_objs: list[MemoryObj]
+    ) -> tuple[list[str], list[int], list[MemoryObj]]:
+        """Copy source chunks into the registered arena and advertise them.
+
+        Returns ``(buffer_uuids, mem_indexes, staged_objs)`` where the refs
+        point at arena pages the peer can one-sided-read. ``free_only`` cap:
+        only a prefix that fits the arena's free slots is staged, so the
+        returned lists may be shorter than ``mem_objs`` (an empty result means
+        the arena is full -> the caller reports a cache miss). ``staged_objs``
+        is the reclamation handle for :meth:`release_staged`.
+        """
+        if not self._use_host_staging or self._staging_arena is None:
+            raise RuntimeError("stage() called but host staging is not enabled")
+        if not mem_objs:
+            return [], [], []
+
+        # free_only cap: reserve one arena slot per source chunk in prefix
+        # order, stopping at the first allocation failure. Atomic under the
+        # arena lock so concurrent stagers cannot both over-commit.
+        arena_objs: list[MemoryObj] = []
+        with self._staging_lock:
+            for src in mem_objs:
+                slot = self._staging_arena.allocate(
+                    src.meta.shape, src.meta.dtype, src.meta.fmt
+                )
+                if slot is None:
+                    break
+                arena_objs.append(slot)
+        num_staged = len(arena_objs)
+        if num_staged == 0:
+            return [], [], []
+
+        # Batched H2H copy off the event loop: torch._foreach_copy_ loops over
+        # the whole batch in C++ with the GIL released, and run_in_executor
+        # frees the loop thread so concurrent handlers keep running.
+        dst_tensors = [a.tensor for a in arena_objs]
+        src_tensors = [mem_objs[i].tensor for i in range(num_staged)]
+
+        def _copy_slice(dst_slice, src_slice) -> float:
+            # Time the copy *inside* the executor thread so we can separate the
+            # actual H2H memcpy cost from executor-queue / GIL-contention wait.
+            _c0 = time.perf_counter()
+            torch._foreach_copy_(dst_slice, src_slice)
+            return time.perf_counter() - _c0
+
+        loop = asyncio.get_running_loop()
+        n_slices = (
+            min(num_staged, self._os_staging_copy_threads)
+            if self._staging_copy_pool is not None and num_staged > 1
+            else 1
+        )
+        _w0 = time.perf_counter()
+        try:
+            if n_slices > 1:
+                # Split the batch across the shared, bounded copy pool. Each
+                # slice memcpy releases the GIL so they run in parallel;
+                # concurrent stagers share this pool rather than each spawning a
+                # fresh fan-out (which would oversubscribe a pinned NUMA node).
+                base, rem = divmod(num_staged, n_slices)
+                tasks = []
+                start = 0
+                for i in range(n_slices):
+                    end = start + base + (1 if i < rem else 0)
+                    tasks.append(
+                        loop.run_in_executor(
+                            self._staging_copy_pool,
+                            _copy_slice,
+                            dst_tensors[start:end],
+                            src_tensors[start:end],
+                        )
+                    )
+                    start = end
+                copy_s = max(await asyncio.gather(*tasks))
+            else:
+                copy_s = await loop.run_in_executor(
+                    None, _copy_slice, dst_tensors, src_tensors
+                )
+        except Exception:
+            # Roll back reserved slots so a copy failure does not leak the arena.
+            self.release_staged(arena_objs)
+            raise
+        wall_s = time.perf_counter() - _w0
+        if wall_s > _STAGE_SLOW_COPY_WARN_S or _STAGE_PROFILE:
+            mb = sum(t.numel() * t.element_size() for t in dst_tensors) / 1e6
+            log = logger.warning if wall_s > _STAGE_SLOW_COPY_WARN_S else logger.info
+            log(
+                "Host-staging copy: wall=%.0f ms copy=%.0f ms (%d chunks, "
+                "%.0f MB, %d slices). wall>>copy => executor/GIL queueing "
+                "(loop starved); wall~=copy => the H2H memcpy dominates.",
+                wall_s * 1000.0,
+                copy_s * 1000.0,
+                num_staged,
+                mb,
+                n_slices,
+            )
+
+        # copy-before-advertise: the arena pages now hold valid data.
+        buffer_uuids, mem_indexes = self.get_local_buffer_refs(arena_objs)
+        return buffer_uuids, mem_indexes, arena_objs
+
+    def release_staged(self, arena_objs: Optional[list[MemoryObj]]) -> None:
+        """Return staged arena pages to the free list (Done / TTL reclaim)."""
+        if not arena_objs:
+            return
+        for obj in arena_objs:
+            # Arena slots are never pinned, so ref_count_down alone returns the
+            # page to the paged allocator's free list.
+            obj.ref_count_down()
 
     def _make_error_response(self) -> HcclErrorResponse:
         return HcclErrorResponse(ok=False)
@@ -637,3 +854,9 @@ class HcclChannel(BaseMultiBufferChannel):
             self.remote_index_addr_dict.clear()
         self._peer_ready_events.clear()
         self.hccl_wrapper.close()
+        if self._staging_copy_pool is not None:
+            self._staging_copy_pool.shutdown(wait=True)
+            self._staging_copy_pool = None
+        if self._staging_arena is not None:
+            self._staging_arena.close()
+            self._staging_arena = None

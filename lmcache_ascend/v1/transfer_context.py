@@ -22,6 +22,7 @@ from typing import Any, List, Optional
 import asyncio
 import concurrent.futures
 import threading
+import time
 
 # Third Party
 from lmcache.logging import init_logger
@@ -31,6 +32,17 @@ import torch
 logger = init_logger(__name__)
 
 _DEFAULT_PIPELINE_DEPTH = 4
+
+
+class LeaseExpiredError(RuntimeError):
+    """Raised when a one-sided read is attempted after its producer lease.
+
+    Under host staging the producer reclaims (and may reuse) the arena slot
+    once its lease (``p2p_pull_pending_ttl``) elapses. The reader must abort
+    before then; raising here routes the pull into the connector's existing
+    failure path (mark blocks invalid -> local recompute), which is safe
+    because the alternative is reading another request's data.
+    """
 
 
 class AscendBaseTransferContext:
@@ -152,6 +164,10 @@ class AscendBaseTransferContext:
         """Deliver the Done signal.  **Must be overridden by subclasses.**"""
         raise NotImplementedError("_send_done() must be implemented by subclasses")
 
+    def check_lease(self) -> None:
+        """No-op by default; overridden where a producer lease applies."""
+        return None
+
 
 class P2PTransferContext(AscendBaseTransferContext):
     """Shared context for a batch of ProxyMemoryObjs from the same P2P lookup.
@@ -176,6 +192,8 @@ class P2PTransferContext(AscendBaseTransferContext):
         dtypes: Optional[List[torch.dtype]] = None,
         fmt: MemoryFormat = MemoryFormat.UNDEFINED,
         use_npu: bool = False,
+        lease_ttl_s: float = 0.0,
+        lease_guard_s: float = 0.0,
     ):
         super().__init__(
             num_proxies=num_proxies,
@@ -189,6 +207,13 @@ class P2PTransferContext(AscendBaseTransferContext):
         self._lookup_id = lookup_id
         self._loop = loop
         self._use_npu = use_npu
+        # Reader-enforced producer lease (host staging). The clock starts now
+        # (RetMsg receipt); local monotonic time avoids cross-host clock skew,
+        # and the guard band absorbs the small offset since the producer's
+        # lease clock started slightly earlier. lease_ttl_s == 0 disables it.
+        self._lease_ttl_s = lease_ttl_s
+        self._lease_guard_s = lease_guard_s
+        self._lease_start = time.monotonic()
         logger.debug(
             "Initialized P2PTransferContext: lookup_id=%s, "
             "target_peer=%s, num_proxies=%d, use_npu=%s, "
@@ -213,6 +238,32 @@ class P2PTransferContext(AscendBaseTransferContext):
     @property
     def target_peer_url(self) -> str:
         return self._target_peer_url
+
+    def lease_remaining_s(self) -> Optional[float]:
+        """Seconds of usable lease left (guard already subtracted), or None.
+
+        None means no lease is in force (``lease_ttl_s == 0``); callers should
+        skip the check in that case.
+        """
+        if self._lease_ttl_s <= 0.0:
+            return None
+        elapsed = time.monotonic() - self._lease_start
+        return self._lease_ttl_s - self._lease_guard_s - elapsed
+
+    def check_lease(self) -> None:
+        """Raise :class:`LeaseExpiredError` if too little lease remains.
+
+        Called by :class:`ProxyMemoryObj` immediately before issuing a
+        one-sided read so the read completes before the producer reclaims the
+        arena slot. No-op when no lease is in force.
+        """
+        remaining = self.lease_remaining_s()
+        if remaining is not None and remaining <= 0.0:
+            raise LeaseExpiredError(
+                f"Producer lease expired for lookup_id {self._lookup_id} "
+                f"(ttl={self._lease_ttl_s:.1f}s guard={self._lease_guard_s:.1f}s); "
+                "aborting one-sided read to avoid a stale arena slot."
+            )
 
     def _send_done(self) -> None:
         """Schedule the Done signal on the P2P loop without blocking callers.

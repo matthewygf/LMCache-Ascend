@@ -177,6 +177,9 @@ class ProxyMemoryObj(MemoryObj):
             "Cannot resolve: no backing buffer assigned. Call set_backing_obj() first."
         )
 
+        # Abort before the producer's arena lease expires (host staging).
+        self._transfer_context.check_lease()
+
         channel_transfer_spec = {
             TS_RECEIVER_ID: self._target_peer_url,
             TS_REMOTE_BUFFER_UUIDS: [self._remote_buffer_uuid],
@@ -244,6 +247,8 @@ class ProxyMemoryObj(MemoryObj):
             return
 
         first = unresolved[0]
+        # Abort before the producer's arena lease expires (host staging).
+        first._transfer_context.check_lease()
         buffers, channel_transfer_spec = ProxyMemoryObj._collect_batch_read_args(
             unresolved
         )
@@ -288,6 +293,8 @@ class ProxyMemoryObj(MemoryObj):
             return None
 
         first = unresolved[0]
+        # Abort before the producer's arena lease expires (host staging).
+        first._transfer_context.check_lease()
         channel = first._transfer_channel
 
         if not hasattr(channel, "submit_batched_read"):

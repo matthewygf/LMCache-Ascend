@@ -48,6 +48,75 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self.current_layer = 0
         self._wait_for_save_done = False
         super().start_load_kv(forward_context, **kwargs)
+        # A deferred P2P pull that timed out / hit a torn channel is swallowed
+        # inside the NPU connector so the forward step survives; it records the
+        # affected req-ids. Convert those into invalid KV blocks here so vLLM
+        # rolls back num_computed_tokens and recomputes the tokens locally,
+        # instead of serving the partially/never-written KV pages.
+        self._mark_failed_p2p_loads_for_recompute()
+
+    def _mark_failed_p2p_loads_for_recompute(self) -> None:
+        """Feed swallowed P2P pull failures into vLLM's invalid-block path.
+
+        Mirrors the partial-load handling in the upstream ``start_load_kv``
+        loop (``record_failed_blocks`` -> ``_invalid_block_ids``), but for
+        whole requests whose deferred pull raised after ``ret_mask`` was
+        already returned as a full hit.
+        """
+        gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+        drain = getattr(gpu_connector, "drain_failed_load_req_ids", None)
+        if drain is None:
+            return
+        failed_req_ids = drain()
+        if not failed_req_ids:
+            return
+
+        metadata = self._parent._get_connector_metadata()
+        if not isinstance(metadata, LMCacheConnectorMetadata):
+            return
+
+        for request in metadata.requests:
+            if request.req_id not in failed_req_ids:
+                continue
+            load_spec = request.load_spec
+            if load_spec is None or not load_spec.can_load:
+                continue
+
+            tokens = request.token_ids
+            # record_failed_blocks moves slot_mapping to CPU internally and we
+            # use it for nothing else on this path, so keep the request's CPU
+            # tensor rather than paying a wasted H2D->D2H round-trip. (The
+            # upstream start_load_kv .to(self.device) is only because that loop
+            # also feeds slot_mapping to the on-device KV load.)
+            slot_mapping = request.slot_mapping
+            token_mask = torch.ones(len(tokens), dtype=torch.bool)
+            masked_token_count = (
+                load_spec.vllm_cached_tokens
+                // self._lmcache_chunk_size
+                * self._lmcache_chunk_size
+            )
+            token_mask[:masked_token_count] = False
+
+            lmcache_cached_tokens = load_spec.lmcache_cached_tokens
+            expected_mask = token_mask[:lmcache_cached_tokens]
+            # The pull is untrusted end-to-end, so report zero retrieved: every
+            # expected block is marked invalid and recomputed. Conservative
+            # (re-loads chunks that may have landed) but always correct.
+            ret_mask = torch.zeros(lmcache_cached_tokens, dtype=torch.bool)
+
+            missing_blocks = self.record_failed_blocks(
+                request.req_id,
+                expected_mask,
+                ret_mask,
+                slot_mapping[:lmcache_cached_tokens],
+            )
+            self._invalid_block_ids.update(missing_blocks)
+            logger.error(
+                "Marked %d KV blocks invalid for req %s after a P2P pull "
+                "failure; vLLM will recompute these tokens locally.",
+                len(missing_blocks),
+                request.req_id,
+            )
 
     @_lmcache_nvtx_annotate
     def wait_for_save(self):

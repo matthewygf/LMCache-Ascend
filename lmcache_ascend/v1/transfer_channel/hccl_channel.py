@@ -48,6 +48,10 @@ _DEFAULT_STAGING_BYTES = 10 * 1024 * 1024 * 1024
 # Hot-path profiling for the staging copy (see p2p_backend for the env knobs).
 _STAGE_PROFILE = os.environ.get("LMCACHE_P2P_PROFILE", "0") == "1"
 _STAGE_SLOW_COPY_WARN_S = float(os.environ.get("LMCACHE_P2P_SLOW_OP_WARN_S", "0.5"))
+_STAGE_LOW_BW_WARN_GBPS = float(os.environ.get("LMCACHE_P2P_LOW_H2H_BW_GBPS", "5.0"))
+_STAGE_LOW_BW_MIN_BYTES = int(
+    os.environ.get("LMCACHE_P2P_LOW_H2H_BW_MIN_BYTES", 64 * 1024 * 1024)
+)
 
 
 class HcclMsgBase(msgspec.Struct, tag=True):
@@ -132,15 +136,15 @@ class HcclChannel(BaseMultiBufferChannel):
         )
         self._staging_arena: Optional[MixedMemoryAllocator] = None
         self._staging_lock = threading.Lock()
-        self._os_staging_copy_threads: int = int(
-            kwargs.pop("os_staging_copy_threads", 32)
+        self._os_staging_copy_threads: int = max(
+            1, int(kwargs.pop("os_staging_copy_threads", 32))
         )
         # Shared, bounded H2H copy pool: concurrent stagers share it instead of
         # each spawning a private fan-out (which would oversubscribe the pinned
         # NUMA node). torch._foreach_copy_ releases the GIL, so slices run in
         # parallel even under torch.set_num_threads(1).
         self._staging_copy_pool: Optional[ThreadPoolExecutor] = None
-        if self._use_host_staging and self._os_staging_copy_threads > 1:
+        if self._use_host_staging:
             self._staging_copy_pool = ThreadPoolExecutor(
                 max_workers=self._os_staging_copy_threads,
                 thread_name_prefix="lmc-staging-copy",
@@ -215,6 +219,124 @@ class HcclChannel(BaseMultiBufferChannel):
     def use_host_staging(self) -> bool:
         return self._use_host_staging
 
+    def allocate_receiver_staging(self, mem_objs: list[MemoryObj]) -> list[MemoryObj]:
+        """Allocate registered CPU staging slots for receiver eager pull."""
+        if not self._use_host_staging or self._staging_arena is None:
+            raise RuntimeError(
+                "allocate_receiver_staging() called but host staging is not enabled"
+            )
+        if not mem_objs:
+            return []
+
+        arena_objs: list[MemoryObj] = []
+        with self._staging_lock:
+            for dst in mem_objs:
+                slot = self._staging_arena.allocate(
+                    dst.meta.shape, dst.meta.dtype, dst.meta.fmt
+                )
+                if slot is None:
+                    break
+                arena_objs.append(slot)
+        return arena_objs
+
+    async def copy_receiver_staging_to(
+        self,
+        staging_objs: list[MemoryObj],
+        dst_objs: list[MemoryObj],
+    ) -> None:
+        """Copy registered receiver staging slots into final CPU MemoryObjs."""
+        if len(staging_objs) != len(dst_objs):
+            raise ValueError(
+                "staging_objs and dst_objs must have the same length, "
+                f"got {len(staging_objs)} and {len(dst_objs)}"
+            )
+        await self._async_h2h_copy(
+            src_tensors=[obj.tensor for obj in staging_objs],
+            dst_tensors=[obj.tensor for obj in dst_objs],
+            label="receiver staging",
+        )
+
+    async def _async_h2h_copy(
+        self,
+        src_tensors: list[torch.Tensor],
+        dst_tensors: list[torch.Tensor],
+        label: str,
+    ) -> None:
+        """Copy host tensors off the event loop with a bounded copy pool."""
+        if len(src_tensors) != len(dst_tensors):
+            raise ValueError(
+                "src_tensors and dst_tensors must have the same length, "
+                f"got {len(src_tensors)} and {len(dst_tensors)}"
+            )
+        if not src_tensors:
+            return
+
+        def _copy_slice(dst_slice, src_slice) -> float:
+            # Time the copy inside the executor thread so wall>>copy means
+            # queueing/GIL pressure, not H2H memcpy time.
+            copy_start = time.perf_counter()
+            torch._foreach_copy_(dst_slice, src_slice)
+            return time.perf_counter() - copy_start
+
+        num_tensors = len(src_tensors)
+        loop = asyncio.get_running_loop()
+        executor = self._staging_copy_pool
+        n_slices = (
+            min(num_tensors, self._os_staging_copy_threads)
+            if executor is not None
+            else 1
+        )
+
+        wall_start = time.perf_counter()
+        if n_slices > 1:
+            base, rem = divmod(num_tensors, n_slices)
+            tasks = []
+            start = 0
+            for i in range(n_slices):
+                end = start + base + (1 if i < rem else 0)
+                tasks.append(
+                    loop.run_in_executor(
+                        executor,
+                        _copy_slice,
+                        dst_tensors[start:end],
+                        src_tensors[start:end],
+                    )
+                )
+                start = end
+            copy_s = max(await asyncio.gather(*tasks))
+        else:
+            copy_s = await loop.run_in_executor(
+                executor, _copy_slice, dst_tensors, src_tensors
+            )
+
+        wall_s = time.perf_counter() - wall_start
+        copied_bytes = sum(t.numel() * t.element_size() for t in dst_tensors)
+        copied_gb = copied_bytes / 1e9
+        wall_gbps = copied_gb / wall_s if wall_s > 0 else float("inf")
+        copy_gbps = copied_gb / copy_s if copy_s > 0 else float("inf")
+        slow_wall = wall_s > _STAGE_SLOW_COPY_WARN_S
+        low_bw = (
+            copied_bytes >= _STAGE_LOW_BW_MIN_BYTES
+            and wall_gbps < _STAGE_LOW_BW_WARN_GBPS
+        )
+        should_warn = slow_wall or low_bw
+        if should_warn or _STAGE_PROFILE:
+            log = logger.warning if should_warn else logger.info
+            log(
+                "Host-staging %s H2H copy: wall=%.0f ms copy=%.0f ms "
+                "(%d chunks, %.0f MB, %d slices, wall_bw=%.2f GB/s, "
+                "copy_bw=%.2f GB/s). wall>>copy => executor/GIL queueing; "
+                "low copy_bw => H2H memcpy bottleneck.",
+                label,
+                wall_s * 1000.0,
+                copy_s * 1000.0,
+                num_tensors,
+                copied_bytes / 1e6,
+                n_slices,
+                wall_gbps,
+                copy_gbps,
+            )
+
     async def stage(
         self, mem_objs: list[MemoryObj]
     ) -> tuple[list[str], list[int], list[MemoryObj]]:
@@ -248,69 +370,16 @@ class HcclChannel(BaseMultiBufferChannel):
         if num_staged == 0:
             return [], [], []
 
-        # Batched H2H copy off the event loop: torch._foreach_copy_ loops over
-        # the whole batch in C++ with the GIL released, and run_in_executor
-        # frees the loop thread so concurrent handlers keep running.
-        dst_tensors = [a.tensor for a in arena_objs]
-        src_tensors = [mem_objs[i].tensor for i in range(num_staged)]
-
-        def _copy_slice(dst_slice, src_slice) -> float:
-            # Time the copy *inside* the executor thread so we can separate the
-            # actual H2H memcpy cost from executor-queue / GIL-contention wait.
-            _c0 = time.perf_counter()
-            torch._foreach_copy_(dst_slice, src_slice)
-            return time.perf_counter() - _c0
-
-        loop = asyncio.get_running_loop()
-        n_slices = (
-            min(num_staged, self._os_staging_copy_threads)
-            if self._staging_copy_pool is not None and num_staged > 1
-            else 1
-        )
-        _w0 = time.perf_counter()
         try:
-            if n_slices > 1:
-                # Split the batch across the shared, bounded copy pool. Each
-                # slice memcpy releases the GIL so they run in parallel;
-                # concurrent stagers share this pool rather than each spawning a
-                # fresh fan-out (which would oversubscribe a pinned NUMA node).
-                base, rem = divmod(num_staged, n_slices)
-                tasks = []
-                start = 0
-                for i in range(n_slices):
-                    end = start + base + (1 if i < rem else 0)
-                    tasks.append(
-                        loop.run_in_executor(
-                            self._staging_copy_pool,
-                            _copy_slice,
-                            dst_tensors[start:end],
-                            src_tensors[start:end],
-                        )
-                    )
-                    start = end
-                copy_s = max(await asyncio.gather(*tasks))
-            else:
-                copy_s = await loop.run_in_executor(
-                    None, _copy_slice, dst_tensors, src_tensors
-                )
+            await self._async_h2h_copy(
+                src_tensors=[mem_objs[i].tensor for i in range(num_staged)],
+                dst_tensors=[a.tensor for a in arena_objs],
+                label="producer staging",
+            )
         except Exception:
             # Roll back reserved slots so a copy failure does not leak the arena.
             self.release_staged(arena_objs)
             raise
-        wall_s = time.perf_counter() - _w0
-        if wall_s > _STAGE_SLOW_COPY_WARN_S or _STAGE_PROFILE:
-            mb = sum(t.numel() * t.element_size() for t in dst_tensors) / 1e6
-            log = logger.warning if wall_s > _STAGE_SLOW_COPY_WARN_S else logger.info
-            log(
-                "Host-staging copy: wall=%.0f ms copy=%.0f ms (%d chunks, "
-                "%.0f MB, %d slices). wall>>copy => executor/GIL queueing "
-                "(loop starved); wall~=copy => the H2H memcpy dominates.",
-                wall_s * 1000.0,
-                copy_s * 1000.0,
-                num_staged,
-                mb,
-                n_slices,
-            )
 
         # copy-before-advertise: the arena pages now hold valid data.
         buffer_uuids, mem_indexes = self.get_local_buffer_refs(arena_objs)

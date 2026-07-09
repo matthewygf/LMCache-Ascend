@@ -7,7 +7,7 @@ NPU devices and are gated with ``@pytest.mark.skipif``.
 """
 
 # Standard
-from concurrent.futures import TimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from unittest.mock import AsyncMock, MagicMock, patch
 import asyncio
 import threading
@@ -142,6 +142,8 @@ def _make_p2p_backend_stub(
     backend.pull_mode = pull_mode
     backend.delay_pull = delay_pull
     backend.use_npu = use_npu
+    backend.use_host_staging = False
+    backend._pull_lease_guard_s = 15.0
     backend.peer_init_url = peer_init_url
     backend.config = MagicMock()
     backend.config.save_unfull_chunk = save_unfull_chunk
@@ -152,6 +154,20 @@ def _make_p2p_backend_stub(
 
     backend._allocate_memory_for_keys = lambda keys, cum_chunk_lengths: (
         AscendP2PBackend._allocate_memory_for_keys(backend, keys, cum_chunk_lengths)
+    )
+    backend._handle_pull_mode_transfer = (
+        lambda lookup_id, target_peer_url, hit_mem_objs, remote_buffer_uuids,
+        remote_mem_indexes, lease_ttl_s=0.0: (
+            AscendP2PBackend._handle_pull_mode_transfer(
+                backend,
+                lookup_id,
+                target_peer_url,
+                hit_mem_objs,
+                remote_buffer_uuids,
+                remote_mem_indexes,
+                lease_ttl_s,
+            )
+        )
     )
 
     return backend
@@ -187,6 +203,56 @@ def async_loop():
 
 class TestAscendP2PBackendUnit:
     """Mock-based unit tests for AscendP2PBackend logic."""
+
+    @pytest.mark.parametrize(
+        "pull_mode,delay_pull,use_npu",
+        [
+            (True, False, False),
+            (True, True, False),
+            (True, True, True),
+        ],
+    )
+    def test_validate_host_staging_mode_accepts_supported_combinations(
+        self, pull_mode, delay_pull, use_npu
+    ):
+        """Host staging supports pull mode plus CPU eager or delay-pull."""
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        AscendP2PBackend._validate_host_staging_mode(
+            True,
+            pull_mode,
+            delay_pull,
+            use_npu,
+        )
+
+    def test_validate_host_staging_mode_rejects_push_mode(self):
+        """Host staging requires pull mode because push writes need receiver refs."""
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        with pytest.raises(
+            AssertionError, match="requires p2p_pull_mode=True"
+        ):
+            AscendP2PBackend._validate_host_staging_mode(
+                True,
+                False,
+                False,
+                False,
+            )
+
+    def test_validate_host_staging_mode_rejects_eager_npu_mode(self):
+        """Eager host staging is supported for CPU pulls first, not NPU pulls."""
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        with pytest.raises(AssertionError, match="p2p_use_npu=False only"):
+            AscendP2PBackend._validate_host_staging_mode(
+                True,
+                True,
+                False,
+                True,
+            )
 
     def test_message_types_encode_decode(self):
         """Verify all Ascend P2P message types roundtrip through msgspec."""
@@ -224,6 +290,7 @@ class TestAscendP2PBackendUnit:
         """Handler writes to client buffers and returns num_hit_chunks."""
         backend = MagicMock()
         backend.loop = async_loop
+        backend.use_host_staging = False
         backend.chunk_size = 256
         backend.transfer_channel = MagicMock()
         backend.transfer_channel.remote_xfer_handler_exists.return_value = True
@@ -261,6 +328,7 @@ class TestAscendP2PBackendUnit:
         """Pull mode returns buffer refs; stores pending resources."""
         backend = MagicMock()
         backend.loop = async_loop
+        backend.use_host_staging = False
         backend.chunk_size = 256
         backend.transfer_channel = MagicMock()
         backend.transfer_channel.remote_xfer_handler_exists.return_value = True
@@ -308,6 +376,7 @@ class TestAscendP2PBackendUnit:
         """Done signal releases pending pull resources."""
         backend = MagicMock()
         backend.loop = async_loop
+        backend.use_host_staging = False
 
         mock_obj = _make_mock_mem_obj()
         backend.pending_pull_resources = {
@@ -451,16 +520,13 @@ class TestAscendP2PBackendUnit:
         backend = MagicMock()
         backend.loop = async_loop
         backend.max_retry_count = 2
+        backend._lookup_timeout_s = 1.0
         backend._ensure_peer_connection = AsyncMock()
+        backend._peer_request_reply = AsyncMock(
+            side_effect=zmq.ZMQError("connection lost")
+        )
 
-        mock_socket = AsyncMock()
-        mock_socket.send = AsyncMock(side_effect=zmq.ZMQError("connection lost"))
-        mock_socket.recv = AsyncMock()
-
-        mock_lock = asyncio.Lock()
         peer_info = MagicMock(spec=PeerInfo)
-        peer_info.lookup_socket = mock_socket
-        peer_info.lookup_lock = mock_lock
         backend.target_peer_info_mapping = {"peer_url": peer_info}
 
         # First Party
@@ -483,7 +549,7 @@ class TestAscendP2PBackendUnit:
         )
 
         assert ret is None
-        assert mock_socket.send.await_count == 2
+        assert backend._peer_request_reply.await_count == 2
         assert backend._ensure_peer_connection.await_count == 2
 
     def test_send_lookup_request_with_retry_success(self, async_loop):
@@ -491,19 +557,14 @@ class TestAscendP2PBackendUnit:
         backend = MagicMock()
         backend.loop = async_loop
         backend.max_retry_count = 3
+        backend._lookup_timeout_s = 1.0
         backend._ensure_peer_connection = AsyncMock()
 
         good_ret = AscendBatchedLookupAndGetRetMsg(num_hit_chunks=2)
         encoded = msgspec.msgpack.encode(good_ret)
 
-        mock_socket = AsyncMock()
-        mock_socket.send = AsyncMock()
-        mock_socket.recv = AsyncMock(return_value=encoded)
-
-        mock_lock = asyncio.Lock()
+        backend._peer_request_reply = AsyncMock(return_value=encoded)
         peer_info = MagicMock(spec=PeerInfo)
-        peer_info.lookup_socket = mock_socket
-        peer_info.lookup_lock = mock_lock
         backend.target_peer_info_mapping = {"peer_url": peer_info}
 
         # First Party
@@ -970,8 +1031,8 @@ class TestAscendP2PBackendUnit:
         proxy_1.ref_count_down()
         context.send_done.assert_called_once()
 
-    def test_p2p_transfer_context_done_uses_configured_timeout(self):
-        """P2P Done waits for the backend-configured short timeout."""
+    def test_p2p_transfer_context_done_is_fire_and_log(self):
+        """P2P Done schedules on the loop without blocking the caller."""
         backend = MagicMock()
         backend.p2p_done_timeout_s = 5.0
         backend._send_done_signal = AsyncMock()
@@ -999,7 +1060,8 @@ class TestAscendP2PBackendUnit:
         ):
             ctx.send_done_now()
 
-        future.result.assert_called_once_with(timeout=5.0)
+        future.add_done_callback.assert_called_once()
+        future.result.assert_not_called()
 
     def test_p2p_transfer_context_done_on_same_loop_schedules_task(self, async_loop):
         """Done from the P2P loop must not block on run_coroutine_threadsafe."""
@@ -1148,6 +1210,278 @@ class TestAscendP2PBackendUnit:
         # Done signal MUST be sent even on failure
         backend._send_done_signal.assert_awaited_once()
 
+    def test_handle_pull_mode_transfer_host_staging_cpu_success(self, async_loop):
+        """CPU eager pull reads into receiver staging then copies to final objs."""
+        backend = MagicMock()
+        backend.loop = async_loop
+        backend.use_host_staging = True
+        backend.delay_pull = False
+        backend.use_npu = False
+        backend._pull_lease_guard_s = 15.0
+        backend.transfer_channel = MagicMock()
+        backend.transfer_channel.async_batched_read = AsyncMock()
+        backend.transfer_channel.copy_receiver_staging_to = AsyncMock()
+        backend.transfer_channel.release_staged = MagicMock()
+        backend._send_done_signal = AsyncMock()
+
+        final_objs = [_make_mock_mem_obj()]
+        staging_objs = [_make_mock_mem_obj()]
+        backend.transfer_channel.allocate_receiver_staging.return_value = staging_objs
+
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        success = _run_coroutine(
+            async_loop,
+            AscendP2PBackend._handle_pull_mode_transfer(
+                backend,
+                "lu_host",
+                "target_peer_url",
+                final_objs,
+                ["ruuid-0"],
+                [10],
+                lease_ttl_s=60.0,
+            ),
+        )
+
+        assert success is True
+        backend.transfer_channel.allocate_receiver_staging.assert_called_once_with(
+            final_objs
+        )
+        backend.transfer_channel.async_batched_read.assert_awaited_once()
+        _, read_kwargs = backend.transfer_channel.async_batched_read.await_args
+        assert read_kwargs["buffers"] == staging_objs
+        backend.transfer_channel.copy_receiver_staging_to.assert_awaited_once_with(
+            staging_objs, final_objs
+        )
+        backend.transfer_channel.release_staged.assert_called_once_with(staging_objs)
+        backend._send_done_signal.assert_awaited_once_with("lu_host", "target_peer_url")
+
+    def test_handle_pull_mode_transfer_host_staging_alloc_shortfall_sends_done(
+        self, async_loop
+    ):
+        """Receiver staging pressure degrades to miss and still sends Done."""
+        backend = MagicMock()
+        backend.loop = async_loop
+        backend.use_host_staging = True
+        backend.delay_pull = False
+        backend.use_npu = False
+        backend._pull_lease_guard_s = 15.0
+        backend.transfer_channel = MagicMock()
+        backend.transfer_channel.async_batched_read = AsyncMock()
+        backend.transfer_channel.copy_receiver_staging_to = AsyncMock()
+        backend.transfer_channel.release_staged = MagicMock()
+        backend._send_done_signal = AsyncMock()
+
+        final_objs = [_make_mock_mem_obj(), _make_mock_mem_obj()]
+        staging_objs = [_make_mock_mem_obj()]
+        backend.transfer_channel.allocate_receiver_staging.return_value = staging_objs
+
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        success = _run_coroutine(
+            async_loop,
+            AscendP2PBackend._handle_pull_mode_transfer(
+                backend,
+                "lu_short",
+                "target_peer_url",
+                final_objs,
+                ["ruuid-0", "ruuid-1"],
+                [10, 11],
+                lease_ttl_s=60.0,
+            ),
+        )
+
+        assert success is False
+        backend.transfer_channel.async_batched_read.assert_not_awaited()
+        backend.transfer_channel.copy_receiver_staging_to.assert_not_awaited()
+        backend.transfer_channel.release_staged.assert_called_once_with(staging_objs)
+        backend._send_done_signal.assert_awaited_once_with(
+            "lu_short", "target_peer_url"
+        )
+
+    def test_handle_pull_mode_transfer_host_staging_copy_failure_sends_done(
+        self, async_loop
+    ):
+        """Copy failure releases receiver staging and sends Done."""
+        backend = MagicMock()
+        backend.loop = async_loop
+        backend.use_host_staging = True
+        backend.delay_pull = False
+        backend.use_npu = False
+        backend._pull_lease_guard_s = 15.0
+        backend.transfer_channel = MagicMock()
+        backend.transfer_channel.async_batched_read = AsyncMock()
+        backend.transfer_channel.copy_receiver_staging_to = AsyncMock(
+            side_effect=RuntimeError("copy failed")
+        )
+        backend.transfer_channel.release_staged = MagicMock()
+        backend._send_done_signal = AsyncMock()
+
+        final_objs = [_make_mock_mem_obj()]
+        staging_objs = [_make_mock_mem_obj()]
+        backend.transfer_channel.allocate_receiver_staging.return_value = staging_objs
+
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        success = _run_coroutine(
+            async_loop,
+            AscendP2PBackend._handle_pull_mode_transfer(
+                backend,
+                "lu_copy_fail",
+                "target_peer_url",
+                final_objs,
+                ["ruuid-0"],
+                [10],
+                lease_ttl_s=60.0,
+            ),
+        )
+
+        assert success is False
+        backend.transfer_channel.async_batched_read.assert_awaited_once()
+        backend.transfer_channel.release_staged.assert_called_once_with(staging_objs)
+        backend._send_done_signal.assert_awaited_once_with(
+            "lu_copy_fail", "target_peer_url"
+        )
+
+    def test_hccl_async_h2h_copy_uses_executor(self, async_loop, monkeypatch):
+        """H2H copy submits work to the bounded executor, off the loop thread."""
+        try:
+            # First Party
+            from lmcache_ascend.v1.transfer_channel.hccl_channel import HcclChannel
+        except (AttributeError, ImportError, OSError) as exc:
+            pytest.skip(f"HcclChannel is unavailable in this test env: {exc}")
+
+        class RecordingExecutor(ThreadPoolExecutor):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.submit_calls = []
+
+            def submit(self, fn, *args, **kwargs):
+                self.submit_calls.append((fn, args, kwargs))
+                return super().submit(fn, *args, **kwargs)
+
+        channel = HcclChannel.__new__(HcclChannel)
+        pool = RecordingExecutor(max_workers=2)
+        channel._staging_copy_pool = pool
+        channel._os_staging_copy_threads = 2
+
+        src_tensors = [torch.ones(4), torch.full((4,), 2.0)]
+        dst_tensors = [torch.zeros(4), torch.zeros(4)]
+        copy_thread_ids = []
+        original_foreach_copy = torch._foreach_copy_
+
+        def wrapped_foreach_copy_(dst, src):
+            copy_thread_ids.append(threading.get_ident())
+            return original_foreach_copy(dst, src)
+
+        monkeypatch.setattr(torch, "_foreach_copy_", wrapped_foreach_copy_)
+
+        async def run_copy():
+            loop_thread_id = threading.get_ident()
+            await HcclChannel._async_h2h_copy(
+                channel,
+                src_tensors,
+                dst_tensors,
+                "unit",
+            )
+            return loop_thread_id
+
+        try:
+            loop_thread_id = _run_coroutine(async_loop, run_copy())
+        finally:
+            pool.shutdown(wait=True)
+
+        assert pool.submit_calls
+        assert copy_thread_ids
+        assert all(thread_id != loop_thread_id for thread_id in copy_thread_ids)
+        assert torch.equal(dst_tensors[0], src_tensors[0])
+        assert torch.equal(dst_tensors[1], src_tensors[1])
+
+    def test_handle_pull_mode_transfer_host_staging_lease_failure_sends_done(
+        self, async_loop
+    ):
+        """A stale producer lease aborts before read and releases producer slots."""
+        backend = MagicMock()
+        backend.loop = async_loop
+        backend._pull_lease_guard_s = 15.0
+        backend.transfer_channel = MagicMock()
+        backend.transfer_channel.async_batched_read = AsyncMock()
+        backend._send_done_signal = AsyncMock()
+
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        success = _run_coroutine(
+            async_loop,
+            AscendP2PBackend._handle_pull_mode_transfer(
+                backend,
+                "lu_lease",
+                "target_peer_url",
+                [_make_mock_mem_obj()],
+                ["ruuid-0"],
+                [10],
+                lease_ttl_s=5.0,
+            ),
+        )
+
+        assert success is False
+        backend.transfer_channel.async_batched_read.assert_not_awaited()
+        backend._send_done_signal.assert_awaited_once_with(
+            "lu_lease", "target_peer_url"
+        )
+
+    def test_batched_get_non_blocking_host_staging_cpu_pull(self, async_loop):
+        """Host-staging CPU eager pull skips final CPU refs and returns CPU objs."""
+        backend = _make_p2p_backend_stub(
+            pull_mode=True, delay_pull=False, use_npu=False
+        )
+        backend.loop = async_loop
+        backend.use_host_staging = True
+        backend.lookup_id_to_peer_mapping = {"lu_host_get": ("target_peer_url", "cpu")}
+
+        final_obj = _make_mock_mem_obj()
+        backend.local_cpu_backend.allocate = MagicMock(return_value=final_obj)
+        backend.transfer_channel.get_local_buffer_refs = MagicMock()
+        backend.transfer_channel.allocate_receiver_staging.return_value = [
+            _make_mock_mem_obj()
+        ]
+        backend.transfer_channel.async_batched_read = AsyncMock()
+        backend.transfer_channel.copy_receiver_staging_to = AsyncMock()
+        backend.transfer_channel.release_staged = MagicMock()
+        backend._send_done_signal = AsyncMock()
+
+        ret_msg = AscendBatchedLookupAndGetRetMsg(
+            num_hit_chunks=1,
+            remote_buffer_uuids=["ruuid-0"],
+            remote_mem_indexes=[10],
+            lease_ttl_s=60.0,
+        )
+        backend._send_lookup_request_with_retry = AsyncMock(return_value=ret_msg)
+
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        result = _run_coroutine(
+            async_loop,
+            AscendP2PBackend.batched_get_non_blocking(
+                backend,
+                "lu_host_get",
+                [_make_key("k1")],
+                {"cum_chunk_lengths": [0, 256], "pin_returned": False},
+            ),
+        )
+
+        assert result == [final_obj]
+        backend.transfer_channel.get_local_buffer_refs.assert_not_called()
+        sent_msg = backend._send_lookup_request_with_retry.await_args.args[2]
+        assert sent_msg.buffer_uuids == []
+        assert sent_msg.mem_indexes == []
+        backend.transfer_channel.async_batched_read.assert_awaited_once()
+        backend.transfer_channel.copy_receiver_staging_to.assert_awaited_once()
+
     def test_handle_get_xfer_not_initialized(self, async_loop):
         """Returns error when transfer handler doesn't exist for receiver."""
         backend = MagicMock()
@@ -1251,6 +1585,8 @@ class TestAscendP2PBackendUnit:
             def __init__(self):
                 self.cancel = MagicMock()
                 self.cancelled = MagicMock(return_value=False)
+                self.done = MagicMock(return_value=False)
+                self.running = MagicMock(return_value=True)
                 self.add_done_callback = MagicMock()
 
             def result(self, timeout=None):
@@ -1268,9 +1604,14 @@ class TestAscendP2PBackendUnit:
         from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
 
         backend._cleanup_late_sync_get_result = (
-            lambda done, lookup_id, operation, unpin: (
+            lambda done, lookup_id, operation, unpin, timeout_at=None: (
                 AscendP2PBackend._cleanup_late_sync_get_result(
-                    backend, done, lookup_id, operation, unpin
+                    backend,
+                    done,
+                    lookup_id,
+                    operation,
+                    unpin,
+                    timeout_at=timeout_at,
                 )
             )
         )
@@ -1306,7 +1647,7 @@ class TestAscendP2PBackendUnit:
         late_obj.unpin.assert_not_called()
 
     # ──────────────────────────────────────────────────────────
-    # _collect_pingpong_kwargs
+    # _collect_transfer_channel_kwargs
     # ──────────────────────────────────────────────────────────
 
     @staticmethod
@@ -1314,7 +1655,7 @@ class TestAscendP2PBackendUnit:
         """Build a config stub whose ``get_extra_config_value(key, default)``
         returns ``extra[key]`` when present and ``default`` otherwise.
         Mirrors the real ``LMCacheEngineConfig`` lookup contract closely
-        enough for ``_collect_pingpong_kwargs`` to run unmodified.
+        enough for ``_collect_transfer_channel_kwargs`` to run unmodified.
         """
         cfg = MagicMock()
 
@@ -1324,11 +1665,8 @@ class TestAscendP2PBackendUnit:
         cfg.get_extra_config_value.side_effect = _get
         return cfg
 
-    def test_collect_pingpong_kwargs_defaults_to_peer_host(self):
-        """No ``pp_*`` keys in extra_config -> only the advertised host is set,
-        and it falls back to ``self.peer_host``. Channel ``PingPongConfig``
-        defaults remain authoritative for everything else.
-        """
+    def test_collect_transfer_channel_kwargs_defaults_to_peer_host(self):
+        """Advertised hosts default to peer_host when extra_config is silent."""
         backend = MagicMock()
         backend.peer_host = "10.0.0.5"
 
@@ -1336,12 +1674,15 @@ class TestAscendP2PBackendUnit:
         from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
 
         cfg = self._make_extra_config_stub({})
-        kwargs = AscendP2PBackend._collect_pingpong_kwargs(backend, cfg)
+        kwargs = AscendP2PBackend._collect_transfer_channel_kwargs(backend, cfg)
 
-        assert kwargs == {"pp_advertised_host": "10.0.0.5"}
+        assert kwargs["pp_advertised_host"] == "10.0.0.5"
+        assert kwargs["os_advertised_host"] == "10.0.0.5"
+        assert "os_ack_timeout_sec" in kwargs
+        assert "os_ack_send_timeout_sec" in kwargs
 
-    def test_collect_pingpong_kwargs_forwards_set_values(self):
-        """Explicit ``pp_*`` knobs in extra_config are forwarded verbatim."""
+    def test_collect_transfer_channel_kwargs_forwards_set_values(self):
+        """Explicit transfer-channel knobs in extra_config are forwarded verbatim."""
         backend = MagicMock()
         backend.peer_host = "127.0.0.1"
 
@@ -1356,17 +1697,19 @@ class TestAscendP2PBackendUnit:
             "pp_tc": 4,
             "pp_sl": 5,
             "pp_transfer_bind_addr": "0.0.0.0:6000",
+            "os_staging_bytes": 1 << 30,
+            "os_staging_copy_threads": 8,
         }
         cfg = self._make_extra_config_stub(extra)
-        kwargs = AscendP2PBackend._collect_pingpong_kwargs(backend, cfg)
+        kwargs = AscendP2PBackend._collect_transfer_channel_kwargs(backend, cfg)
 
         for key, value in extra.items():
             assert kwargs[key] == value
-        # pp_advertised_host still gets defaulted from peer_host.
         assert kwargs["pp_advertised_host"] == "127.0.0.1"
+        assert kwargs["os_advertised_host"] == "127.0.0.1"
 
-    def test_collect_pingpong_kwargs_explicit_advertised_host_overrides(self):
-        """``pp_advertised_host`` from extra_config wins over peer_host."""
+    def test_collect_transfer_channel_kwargs_explicit_advertised_host_overrides(self):
+        """Advertised host extra_config values win over peer_host."""
         backend = MagicMock()
         backend.peer_host = "127.0.0.1"
 
@@ -1374,13 +1717,17 @@ class TestAscendP2PBackendUnit:
         from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
 
         cfg = self._make_extra_config_stub(
-            {"pp_advertised_host": "192.168.1.42"}
+            {
+                "pp_advertised_host": "192.168.1.42",
+                "os_advertised_host": "192.168.1.43",
+            }
         )
-        kwargs = AscendP2PBackend._collect_pingpong_kwargs(backend, cfg)
+        kwargs = AscendP2PBackend._collect_transfer_channel_kwargs(backend, cfg)
 
-        assert kwargs == {"pp_advertised_host": "192.168.1.42"}
+        assert kwargs["pp_advertised_host"] == "192.168.1.42"
+        assert kwargs["os_advertised_host"] == "192.168.1.43"
 
-    def test_collect_pingpong_kwargs_skips_none_only(self):
+    def test_collect_transfer_channel_kwargs_skips_none_only(self):
         """Falsy-but-meaningful values (0, False) are still forwarded; only
         explicit ``None`` (i.e. unset) is dropped. Guards against accidentally
         suppressing ``pp_tc=0`` or ``pp_wait_recv_done=False``.
@@ -1394,7 +1741,7 @@ class TestAscendP2PBackendUnit:
         cfg = self._make_extra_config_stub(
             {"pp_tc": 0, "pp_wait_recv_done": False}
         )
-        kwargs = AscendP2PBackend._collect_pingpong_kwargs(backend, cfg)
+        kwargs = AscendP2PBackend._collect_transfer_channel_kwargs(backend, cfg)
 
         assert kwargs["pp_tc"] == 0
         assert kwargs["pp_wait_recv_done"] is False

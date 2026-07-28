@@ -671,15 +671,24 @@ class AscendLMCacheEngine(LMCacheEngine):
                     )
 
         # NOTE(niming) --- Sharded broadcast ---
-        # The sharded pipeline handles both broadcast and to_gpu internally,
-        # so we do not invoke batched_to_gpu below for either rank.
-        # Rank 0's to_gpu reuses the NPU tensors produced by the broadcast
-        # and non-rank-0's runs on the broadcast receive buffers, avoiding
-        # a second CPU->NPU PCIe transfer.
+        # When save_only_first_rank is set, the sharded pipeline handles both
+        # broadcast and to_gpu internally, so we do not invoke batched_to_gpu
+        # below for either rank. Rank 0's to_gpu reuses the NPU tensors
+        # produced by the broadcast and non-rank-0's runs on the broadcast
+        # receive buffers, avoiding a second CPU->NPU PCIe transfer.
+        # When save_only_first_rank is False (typical non-MLA path), we must
+        # still load retrieved CPU/proxy memory objects onto the NPU —
+        # otherwise ret_mask reports hits while paged KV was never written.
         if self.save_only_first_rank:
             with retrieve_stats.profile_broadcast():
                 self._pipelined_sharded_broadcast_and_load(
                     reordered_chunks, ret_mask, **kwargs
+                )
+        elif len(reordered_chunks) > 0:
+            with retrieve_stats.profile_to_gpu():
+                _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
+                self.gpu_connector.batched_to_gpu(
+                    list(memory_objs), list(starts), list(ends), **kwargs
                 )
 
         # --- Cleanup ---

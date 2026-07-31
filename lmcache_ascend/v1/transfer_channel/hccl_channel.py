@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Optional, Union
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from typing import Dict, List, Optional, Union
 import asyncio
 import pickle
 import threading
@@ -222,7 +222,15 @@ class HcclChannel(BaseMultiBufferChannel):
         src_tensors: list[torch.Tensor],
         dst_tensors: list[torch.Tensor],
     ) -> None:
-        """Copy host tensors off the event loop with a bounded copy pool."""
+        """Copy host tensors off the event loop with a bounded copy pool.
+
+        The await is cancellation-safe: ThreadPoolExecutor workers are drained
+        before this coroutine returns or raises. Callers such as
+        ``copy_receiver_staging_to`` / ``stage`` may ``release_staged()`` as
+        soon as the await completes; abandoning in-flight H2H workers would
+        UAF the staging arena on reuse (e.g. sync-get timeout cancel during
+        the post-DMA H2H copy).
+        """
         if len(src_tensors) != len(dst_tensors):
             raise ValueError(
                 "src_tensors and dst_tensors must have the same length, "
@@ -243,24 +251,48 @@ class HcclChannel(BaseMultiBufferChannel):
             else 1
         )
 
+        if executor is None:
+            # No dedicated pool: still shield so cancel cannot return while
+            # the default-executor copy is mid-write into staging/dst.
+            await asyncio.shield(
+                loop.run_in_executor(None, _copy_slice, dst_tensors, src_tensors)
+            )
+            return
+
+        cf_futures: List[Future] = []
         if n_slices > 1:
             base, rem = divmod(num_tensors, n_slices)
-            tasks = []
             start = 0
             for i in range(n_slices):
                 end = start + base + (1 if i < rem else 0)
-                tasks.append(
-                    loop.run_in_executor(
-                        executor,
+                cf_futures.append(
+                    executor.submit(
                         _copy_slice,
                         dst_tensors[start:end],
                         src_tensors[start:end],
                     )
                 )
                 start = end
-            await asyncio.gather(*tasks)
         else:
-            await loop.run_in_executor(executor, _copy_slice, dst_tensors, src_tensors)
+            cf_futures.append(
+                executor.submit(_copy_slice, dst_tensors, src_tensors)
+            )
+
+        def _wait_all_results() -> None:
+            # Join every worker before the event-loop task can observe
+            # completion/cancellation. ``Future.cancel()`` on the asyncio
+            # side does not stop these threads.
+            wait(cf_futures)
+            for fut in cf_futures:
+                fut.result()
+
+        try:
+            await asyncio.shield(loop.run_in_executor(None, _wait_all_results))
+        except asyncio.CancelledError:
+            pending = [fut for fut in cf_futures if not fut.done()]
+            if pending:
+                await asyncio.shield(loop.run_in_executor(None, wait, pending))
+            raise
 
     async def stage(
         self, mem_objs: list[MemoryObj]
@@ -289,7 +321,10 @@ class HcclChannel(BaseMultiBufferChannel):
                 src_tensors=[mem_objs[i].tensor for i in range(num_staged)],
                 dst_tensors=[a.tensor for a in arena_objs],
             )
-        except Exception:
+        except (Exception, asyncio.CancelledError):
+            # Safe to freelist: ``_async_h2h_copy`` drains workers first.
+            # Include CancelledError (BaseException) so sync-get timeout
+            # cannot leak arena pages until channel teardown.
             self.release_staged(arena_objs)
             raise
 

@@ -497,6 +497,28 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask[start:end_pos] = True
         return objs, starts, ends
 
+    def _sender_chunks_broadcastable(self, reordered_chunks: list) -> bool:
+        """Return False if any sender chunk lacks a materialized ``raw_tensor``.
+
+        Unresolved delay-pull ``ProxyMemoryObj`` placeholders have
+        ``raw_tensor is None``. Entering the shard ``broadcast_fn`` loop
+        in that state deadlocks TP: receivers call ``broadcast_fn``
+        before fill, while the sender raises inside ``_fill_shard_sender``.
+        """
+        for _, mem_obj, start, end_pos in reordered_chunks:
+            if getattr(mem_obj, "raw_tensor", None) is None:
+                logger.error(
+                    "rank=%d cannot sharded-broadcast chunk [%d:%d]: "
+                    "raw_tensor is None (unresolved proxy / empty backing). "
+                    "Aborting TP broadcast for all ranks. Prefer eager "
+                    "CPU host-staging pull when save_only_first_rank=True.",
+                    self.metadata.worker_id,
+                    start,
+                    end_pos,
+                )
+                return False
+        return True
+
     def _pipeline_broadcast_and_load(
         self,
         plan: Dict[str, Any],
@@ -518,6 +540,27 @@ class AscendLMCacheEngine(LMCacheEngine):
         meta_table = plan["meta"]
         shard_plan = plan["shard_plan"]
         shard_layouts = plan["shard_layouts"]
+
+        # Coordinated start gate: all ranks must agree to enter the
+        # shard ``broadcast_fn`` loop. Without this, a sender-only raise
+        # (e.g. delay-pull proxy with raw_tensor is None) leaves
+        # receivers blocked forever inside the collective.
+        if is_sender:
+            can_run: Optional[bool] = self._sender_chunks_broadcastable(
+                reordered_chunks
+            )
+        else:
+            can_run = None
+        can_run = self.broadcast_object_fn(can_run, self.metadata.first_rank)
+        if not can_run:
+            if is_sender:
+                for _, mem_obj, _, _ in reordered_chunks:
+                    try:
+                        mem_obj.ref_count_down()
+                    except Exception:
+                        pass
+            return
+
         device = f"npu:{self.metadata.worker_id}"
         if not self._ensure_merged_pool(plan["max_shard_bytes"], device):
             raise RuntimeError(
@@ -576,7 +619,17 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self._submit_togpu(prev_ctx, load_stream, pending, **kwargs)
 
         finally:
-            load_stream.synchronize()
+            # H2D copies run on broadcast_stream (non_blocking). Drain it
+            # before releasing sender CPU mem_objs, or an exception after
+            # a partial fill can free pages under in-flight DMA.
+            try:
+                self.broadcast_stream.synchronize()
+            except Exception:
+                pass
+            try:
+                load_stream.synchronize()
+            except Exception:
+                pass
             for objs, _ in pending:
                 for obj in objs:
                     try:

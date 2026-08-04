@@ -25,7 +25,6 @@ def _make_engine(monkeypatch, *, total_mem, allocated, per_chunk_bytes):
     engine.metadata = SimpleNamespace(
         chunk_size=256,
         worker_id=0,
-        local_worker_id=0,
         get_shapes=lambda _cs: ("unused",),  # bypassed by get_size_bytes patch
         get_dtypes=lambda: ("unused",),
     )
@@ -38,6 +37,7 @@ def _make_engine(monkeypatch, *, total_mem, allocated, per_chunk_bytes):
     )
 
     # --- Patch torch.npu device APIs ---
+    monkeypatch.setattr(ce_mod.torch.npu, "current_device", lambda: 0)
     fake_props = SimpleNamespace(total_memory=total_mem)
     monkeypatch.setattr(
         ce_mod.torch.npu,
@@ -131,8 +131,8 @@ class TestEstimateShardSize:
         with pytest.raises(RuntimeError, match="Invalid per-chunk size"):
             engine._estimate_shard_size()
 
-    def test_queries_local_worker_id_not_global_rank(self, monkeypatch):
-        """Multi-node: memory queries must use local_worker_id, not worker_id."""
+    def test_queries_current_device_not_global_rank(self, monkeypatch):
+        """Memory queries must use torch.npu.current_device(), not worker_id."""
         # First Party
         from lmcache_ascend.v1 import cache_engine as ce_mod
 
@@ -143,7 +143,7 @@ class TestEstimateShardSize:
             per_chunk_bytes=10 * MB,
         )
         engine.metadata.worker_id = 9
-        engine.metadata.local_worker_id = 1
+        monkeypatch.setattr(ce_mod.torch.npu, "current_device", lambda: 1)
 
         queried = []
 

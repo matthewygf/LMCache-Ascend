@@ -174,24 +174,6 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self._broadcast_shard_size,
             )
 
-    def _local_npu_device_id(self) -> int:
-        """Return the host-local NPU index for this worker.
-
-        ``metadata.worker_id`` is the *global* rank. On multi-node
-        deployments it can exceed ``torch.npu.device_count() - 1``, so
-        device allocations and memory queries must use
-        ``metadata.local_worker_id`` (the GPU-bound id on this host).
-        Falls back to ``worker_id % device_count`` when
-        ``local_worker_id`` is unavailable (older metadata / tests).
-        """
-        local_id = getattr(self.metadata, "local_worker_id", None)
-        if local_id is not None:
-            return int(local_id)
-        num_gpus = torch.npu.device_count()
-        if num_gpus <= 0:
-            return int(self.metadata.worker_id)
-        return int(self.metadata.worker_id) % num_gpus
-
     def _estimate_shard_size(self) -> int:
         """Estimate a safe ``broadcast_shard_size`` from available NPU memory.
 
@@ -205,7 +187,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         dtypes = self.metadata.get_dtypes()
         per_chunk_bytes = get_size_bytes(shapes, dtypes)
 
-        device = self._local_npu_device_id()
+        # Use the process-bound NPU (set by CreateNPUConnector / vLLM),
+        # not metadata.worker_id which is the global rank on multi-node.
+        device = torch.npu.current_device()
         props = torch.npu.get_device_properties(device)
         total_mem = props.total_memory
         allocated = torch.npu.memory_allocated(device)
@@ -536,8 +520,10 @@ class AscendLMCacheEngine(LMCacheEngine):
         meta_table = plan["meta"]
         shard_plan = plan["shard_plan"]
         shard_layouts = plan["shard_layouts"]
-        # Use host-local NPU id — global worker_id is wrong on multi-node.
-        device = f"npu:{self._local_npu_device_id()}"
+        # Match broadcast_stream / load_stream: bind to the process NPU
+        # (CreateNPUConnector already set_device). Do not use
+        # metadata.worker_id — that is the global rank on multi-node.
+        device = f"npu:{torch.npu.current_device()}"
 
         pending: List[Tuple[List[MemoryObj], torch.npu.Event]] = []
 
@@ -604,7 +590,12 @@ class AscendLMCacheEngine(LMCacheEngine):
             try:
                 load_stream.synchronize()
             except Exception:
-                pass
+                logger.error(
+                    "rank=%d failed to synchronize load_stream during "
+                    "sharded broadcast cleanup",
+                    self.metadata.worker_id,
+                    exc_info=True,
+                )
             for objs, _ in pending:
                 for obj in objs:
                     try:

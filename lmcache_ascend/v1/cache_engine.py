@@ -497,6 +497,31 @@ class AscendLMCacheEngine(LMCacheEngine):
             ret_mask[start:end_pos] = True
         return objs, starts, ends
 
+    def _allgather_ok(self, local_ok: bool) -> bool:
+        """AND ``local_ok`` across the TP group via successive object broadcasts.
+
+        ``broadcast_object_fn`` is src-rooted (no native allgather). Each rank
+        in ``[0, world_size)`` broadcasts its flag; every rank ANDs the results.
+        Used as a coordinated abort gate so one rank's failure cannot leave
+        peers blocked inside ``broadcast_fn``.
+        """
+        world_size = self.metadata.world_size
+        worker_id = self.metadata.worker_id
+        all_ok = True
+        for src in range(world_size):
+            payload: Optional[bool] = local_ok if worker_id == src else None
+            remote_ok = self.broadcast_object_fn(payload, src)
+            if not remote_ok:
+                all_ok = False
+        if not all_ok:
+            logger.error(
+                "rank=%d sharded-broadcast readiness gate failed "
+                "(local_ok=%s); aborting TP broadcast for all ranks",
+                worker_id,
+                local_ok,
+            )
+        return all_ok
+
     def _pipeline_broadcast_and_load(
         self,
         plan: Dict[str, Any],
@@ -519,17 +544,27 @@ class AscendLMCacheEngine(LMCacheEngine):
         shard_plan = plan["shard_plan"]
         shard_layouts = plan["shard_layouts"]
         device = f"npu:{self.metadata.worker_id}"
-        if not self._ensure_merged_pool(plan["max_shard_bytes"], device):
-            raise RuntimeError(
-                f"Failed to allocate merged broadcast pool on {device} "
-                f"({plan['max_shard_bytes']} bytes/slot). "
-                "Consider reducing broadcast_shard_size."
-            )
 
         pending: List[Tuple[List[MemoryObj], torch.npu.Event]] = []
 
         prev_ctx = None
         try:
+            # Allocate inside try so sender CPU mem_objs are always
+            # released in finally when the pool gate fails.
+            # (retrieve() skips ref_count_down for the first rank when
+            # save_only_first_rank is set, assuming this pipeline owns them.)
+            #
+            # Coordinate success across TP: a local raise after a peer has
+            # already entered broadcast_fn deadlocks the group under
+            # asymmetric NPU free-memory (merged-pool OOM on a subset).
+            local_ok = self._ensure_merged_pool(plan["max_shard_bytes"], device)
+            if not self._allgather_ok(local_ok):
+                raise RuntimeError(
+                    f"Failed to allocate merged broadcast pool on at least "
+                    f"one TP rank ({plan['max_shard_bytes']} bytes/slot on "
+                    f"{device}). Consider reducing broadcast_shard_size."
+                )
+
             for shard_idx, _ in enumerate(shard_plan):
                 layout = shard_layouts[shard_idx]
                 slot = shard_idx % 2
@@ -576,7 +611,15 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self._submit_togpu(prev_ctx, load_stream, pending, **kwargs)
 
         finally:
-            load_stream.synchronize()
+            try:
+                load_stream.synchronize()
+            except Exception:
+                logger.error(
+                    "rank=%d failed to synchronize load_stream during "
+                    "sharded broadcast cleanup",
+                    self.metadata.worker_id,
+                    exc_info=True,
+                )
             for objs, _ in pending:
                 for obj in objs:
                     try:

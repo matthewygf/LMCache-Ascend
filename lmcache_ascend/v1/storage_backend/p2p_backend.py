@@ -330,12 +330,17 @@ class AscendP2PBackend(P2PBackend):
                     * _align_bytes
                 )
 
+                # Prefer local_worker_id (process-local rank). get_correct_device
+                # also binds to torch.npu.current_device() when already set.
+                local_worker_id = getattr(
+                    metadata, "local_worker_id", metadata.worker_id
+                )
                 self.memory_allocator.init_gpu_memory_allocator(
                     align_allocator_bytes,
                     self.full_size_shapes,
                     self.dtypes,
                     self.fmt,
-                    get_correct_device("npu", metadata.worker_id),
+                    get_correct_device("npu", local_worker_id),
                 )
 
             gpu_alloc = self.memory_allocator.gpu_allocator

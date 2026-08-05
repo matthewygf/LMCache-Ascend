@@ -17,17 +17,35 @@ def get_correct_device(device: str, worker_id: int) -> str:
 
     Args:
         device (str): The device string, could be cpu or npu.
-        worker_id (int): The worker id to determine the npu device.
+        worker_id (int): Worker / rank id used only as a fallback when
+            mapping to a local NPU. On multi-node this is often the
+            *global* rank and must not be used as a raw device index.
 
     Returns:
         str: The correct device string with device id.
     """
     if device == "cpu":
         return "cpu"
-    elif device.startswith("npu"):
-        return f"npu:{worker_id}"
-    else:
+    if not device.startswith("npu"):
         raise ValueError(f"Invalid device: {device}")
+
+    # Prefer the process-bound NPU (CreateNPUConnector / vLLM already
+    # called set_device). Falling back to worker_id as a raw index is
+    # wrong on multi-node (global rank) and when ASCEND_RT_VISIBLE_DEVICES
+    # remaps a single device to npu:0 — match CreateNPUConnector's
+    # ``worker_id % device_count`` mapping instead.
+    num_gpus = torch.npu.device_count()
+    if num_gpus <= 0:
+        raise RuntimeError("No NPU devices available")
+
+    try:
+        current = int(torch.npu.current_device())
+        if 0 <= current < num_gpus:
+            return f"npu:{current}"
+    except Exception:
+        pass
+
+    return f"npu:{worker_id % num_gpus}"
 
 
 def _build_buffer_configs(

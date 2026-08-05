@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from concurrent.futures import Future, ThreadPoolExecutor, wait
-from typing import Dict, List, Optional, Union
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Any, Dict, List, Optional, Union
 import asyncio
 import pickle
 import threading
@@ -39,6 +39,31 @@ from .transfer_spec import TS_RECEIVER_ID
 logger = init_logger(__name__)
 
 _DEFAULT_STAGING_BYTES = 10 * 1024 * 1024 * 1024
+
+
+async def _await_settled(fut: "asyncio.Future") -> Any:
+    """Await ``fut`` without letting cancellation resume the caller early.
+
+    ``asyncio.shield`` keeps *fut* running across a cancel, but the awaiting
+    coroutine still resumes immediately, and ``Future.cancel()`` cannot stop
+    executor work that already started. A single shielded await therefore
+    still lets a caller reclaim buffers while worker threads write into them.
+    Re-await until *fut* actually settles, then re-raise the cancellation.
+    """
+    cancelled: Optional[asyncio.CancelledError] = None
+    while not fut.done():
+        try:
+            await asyncio.shield(fut)
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+    if cancelled is not None:
+        if not fut.cancelled() and fut.exception() is not None:
+            logger.warning(
+                "Shielded operation failed while its caller was cancelled: %s",
+                fut.exception(),
+            )
+        raise cancelled
+    return fut.result()
 
 
 class HcclMsgBase(msgspec.Struct, tag=True):
@@ -252,13 +277,13 @@ class HcclChannel(BaseMultiBufferChannel):
         )
 
         if executor is None:
-            # No dedicated pool: still shield so cancel cannot return while
-            # the default-executor copy is mid-write into staging/dst.
-            await asyncio.shield(
+            await _await_settled(
                 loop.run_in_executor(None, _copy_slice, dst_tensors, src_tensors)
             )
             return
 
+        # Submit directly to the pool: the returned handles are owned here and
+        # cannot be detached by task cancellation, unlike ``run_in_executor``.
         cf_futures: List[Future] = []
         if n_slices > 1:
             base, rem = divmod(num_tensors, n_slices)
@@ -274,25 +299,19 @@ class HcclChannel(BaseMultiBufferChannel):
                 )
                 start = end
         else:
-            cf_futures.append(
-                executor.submit(_copy_slice, dst_tensors, src_tensors)
+            cf_futures.append(executor.submit(_copy_slice, dst_tensors, src_tensors))
+
+        # ``return_exceptions`` so a failing slice cannot resume the caller
+        # while sibling threads are still writing into the same pages.
+        results = await _await_settled(
+            asyncio.gather(
+                *(asyncio.wrap_future(cf, loop=loop) for cf in cf_futures),
+                return_exceptions=True,
             )
-
-        def _wait_all_results() -> None:
-            # Join every worker before the event-loop task can observe
-            # completion/cancellation. ``Future.cancel()`` on the asyncio
-            # side does not stop these threads.
-            wait(cf_futures)
-            for fut in cf_futures:
-                fut.result()
-
-        try:
-            await asyncio.shield(loop.run_in_executor(None, _wait_all_results))
-        except asyncio.CancelledError:
-            pending = [fut for fut in cf_futures if not fut.done()]
-            if pending:
-                await asyncio.shield(loop.run_in_executor(None, wait, pending))
-            raise
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     async def stage(
         self, mem_objs: list[MemoryObj]

@@ -100,6 +100,48 @@ class TestAsyncH2HCopyDrain:
             release_gate.set()
             channel._staging_copy_pool.shutdown(wait=True)
 
+    def test_repeated_cancel_still_drains(self, monkeypatch):
+        """Repeated cancels must not resume the caller before workers finish.
+
+        A sync-get timeout can be followed by a second cancel (e.g. loop
+        teardown cancelling pending tasks). A single shielded await would
+        resume on the second cancel, freeing pages under live writers.
+        """
+        channel = _make_channel(copy_threads=2)
+        started = threading.Barrier(3)  # 2 workers + main
+        release_gate = threading.Event()
+        finished = []
+
+        def slow_foreach(dst_slice, src_slice):
+            started.wait(timeout=2)
+            assert release_gate.wait(timeout=3)
+            finished.append(threading.current_thread().name)
+
+        monkeypatch.setattr(torch, "_foreach_copy_", slow_foreach)
+
+        src = [torch.ones(8), torch.ones(8)]
+        dst = [torch.zeros(8), torch.zeros(8)]
+
+        async def _cancel_twice():
+            loop = asyncio.get_running_loop()
+            task = asyncio.create_task(channel._async_h2h_copy(src, dst))
+            await loop.run_in_executor(None, lambda: started.wait(timeout=2))
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0.02)
+            # Workers are provably still copying; the task must not be done.
+            assert not task.done(), "resumed before H2H workers were drained"
+            release_gate.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert len(finished) == 2
+
+        try:
+            _run(_cancel_twice())
+        finally:
+            release_gate.set()
+            channel._staging_copy_pool.shutdown(wait=True)
+
     def test_exception_in_one_slice_drains_siblings(self, monkeypatch):
         """A failing slice must not freelist while sibling workers still run."""
         channel = _make_channel(copy_threads=2)

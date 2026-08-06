@@ -45,17 +45,17 @@ void free_pinned_ptr(uintptr_t ptr) {
 /*
  * This function is potentially slow for the mbind
  */
-uintptr_t alloc_pinned_numa_ptr(std::size_t size, int node) {
+uintptr_t alloc_pinned_numa_ptr(std::size_t size, unsigned long numa_mask) {
   void *ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (ptr == MAP_FAILED) {
     throw std::runtime_error(std::string("mmap failed: ") + strerror(errno));
   }
 
-  // Maximum of 64 numa nodes
-  unsigned long mask = 1UL << node;
-  long maxnode = 8 * sizeof(mask);
-  int err = mbind(ptr, size, MPOL_BIND, &mask, maxnode,
+  // numa_mask is a bitmask of NUMA nodes to bind to.
+  // E.g., 0x3 binds to nodes 0 and 1, 0xC binds to nodes 2 and 3.
+  long maxnode = 8 * sizeof(numa_mask);
+  int err = mbind(ptr, size, MPOL_BIND, &numa_mask, maxnode,
                   MPOL_MF_MOVE | MPOL_MF_STRICT);
   if (err != 0) {
     munmap(ptr, size);

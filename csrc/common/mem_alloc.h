@@ -11,6 +11,6 @@ uintptr_t alloc_pinned_ptr(std::size_t size, unsigned int flags);
 
 void free_pinned_ptr(uintptr_t ptr);
 
-uintptr_t alloc_pinned_numa_ptr(std::size_t size, int node);
+uintptr_t alloc_pinned_numa_ptr(std::size_t size, unsigned long numa_mask);
 
 void free_pinned_numa_ptr(uintptr_t ptr, std::size_t size);

@@ -37,6 +37,58 @@ pytestmark = pytest.mark.skipif(
     reason="hccl channel extension not built (set HCOMM_SRC_PATH at build time)",
 )
 
+# How long a parked fake copy waits to be released. Only a safety net so a
+# broken test cannot hang the suite; the test always releases explicitly.
+_HOLD_TIMEOUT_S = 10.0
+# How long we keep asserting the caller stays blocked while workers are live.
+_OBSERVE_S = 0.5
+# Duration of the slow sibling slice in the failing-slice test.
+_SIBLING_COPY_S = 0.5
+
+
+class _ParkedCopy:
+    """Fake ``torch._foreach_copy_`` that parks *inside* the copy body.
+
+    Makes worker liveness directly observable instead of assumed:
+    ``live_workers`` counts threads currently inside the copy, and no worker
+    can leave until :meth:`release` is called. A test can therefore assert
+    "N threads are still writing" at the same moment it asserts the caller
+    has not been resumed.
+    """
+
+    def __init__(self, num_workers: int):
+        self.num_workers = num_workers
+        self._all_inside = threading.Barrier(num_workers + 1)
+        self._gate = threading.Event()
+        self._lock = threading.Lock()
+        self._live = 0
+        self.finished: list[str] = []
+
+    def __call__(self, dst_slice, src_slice) -> None:
+        with self._lock:
+            self._live += 1
+        try:
+            self._all_inside.wait(timeout=_HOLD_TIMEOUT_S)
+            if not self._gate.wait(timeout=_HOLD_TIMEOUT_S):
+                raise AssertionError("copy gate was never released by the test")
+            with self._lock:
+                self.finished.append(threading.current_thread().name)
+        finally:
+            with self._lock:
+                self._live -= 1
+
+    @property
+    def live_workers(self) -> int:
+        with self._lock:
+            return self._live
+
+    def wait_until_all_inside(self) -> None:
+        """Block until every worker has entered the copy body."""
+        self._all_inside.wait(timeout=_HOLD_TIMEOUT_S)
+
+    def release(self) -> None:
+        self._gate.set()
+
 
 def _make_channel(*, copy_threads: int = 2) -> HcclChannel:
     channel = object.__new__(HcclChannel)
@@ -52,6 +104,27 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+async def _assert_blocked_while_workers_live(task, copy: _ParkedCopy, seconds: float):
+    """Assert the caller stays blocked for *seconds* while workers are live.
+
+    Both halves matter: ``live_workers`` proves the copy threads really are
+    still inside the copy, and ``task.done()`` proves the caller has not been
+    resumed (which is what would let it hand the staging page back).
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while loop.time() < deadline:
+        live = copy.live_workers
+        assert live == copy.num_workers, (
+            f"expected {copy.num_workers} copy threads still inside the copy, "
+            f"saw {live} (gate has not been released yet)"
+        )
+        assert not task.done(), (
+            f"caller resumed while {live} copy thread(s) were still writing"
+        )
+        await asyncio.sleep(0.02)
+
+
 class TestAsyncH2HCopyDrain:
     def test_cancel_waits_for_executor_workers(self, monkeypatch):
         """Cancelled await must not return while H2H workers still write.
@@ -62,42 +135,36 @@ class TestAsyncH2HCopyDrain:
         UAFs the pages under in-flight ``torch._foreach_copy_``.
         """
         channel = _make_channel(copy_threads=2)
-        started = threading.Barrier(3)  # 2 workers + main
-        release_gate = threading.Event()
-        unfinished_at_return = []
-
-        def slow_foreach(dst_slice, src_slice):
-            started.wait(timeout=2)
-            # Hold the copy open until the test observes cancel path.
-            assert release_gate.wait(timeout=2)
-            # Marker read after gate opens — must complete before await returns.
-            unfinished_at_return.append(threading.current_thread().name)
-
-        monkeypatch.setattr(torch, "_foreach_copy_", slow_foreach)
+        copy = _ParkedCopy(num_workers=2)
+        monkeypatch.setattr(torch, "_foreach_copy_", copy)
 
         src = [torch.ones(8), torch.ones(8)]
         dst = [torch.zeros(8), torch.zeros(8)]
 
         async def _cancel_mid_copy():
+            loop = asyncio.get_running_loop()
             task = asyncio.create_task(channel._async_h2h_copy(src, dst))
-            # Wait until both slice workers have entered the copy body.
-            await asyncio.get_running_loop().run_in_executor(
-                None, lambda: started.wait(timeout=2)
-            )
-            task.cancel()
-            # Let workers finish only after cancel is requested — the
-            # drained await must still block until they complete.
-            await asyncio.sleep(0.05)
-            release_gate.set()
+            await loop.run_in_executor(None, copy.wait_until_all_inside)
+
+            # Release inside the coroutine even on failure: parked workers
+            # would otherwise stall asyncio.run()'s executor shutdown until
+            # the _HOLD_TIMEOUT_S safety net fires.
+            try:
+                task.cancel()
+                await _assert_blocked_while_workers_live(task, copy, _OBSERVE_S)
+            finally:
+                copy.release()
+
             with pytest.raises(asyncio.CancelledError):
                 await task
-            # If drain worked, both workers finished before await returned.
-            assert len(unfinished_at_return) == 2
+            # Every worker ran to completion before the await returned.
+            assert len(copy.finished) == 2
+            assert copy.live_workers == 0
 
         try:
             _run(_cancel_mid_copy())
         finally:
-            release_gate.set()
+            copy.release()
             channel._staging_copy_pool.shutdown(wait=True)
 
     def test_repeated_cancel_still_drains(self, monkeypatch):
@@ -108,38 +175,34 @@ class TestAsyncH2HCopyDrain:
         resume on the second cancel, freeing pages under live writers.
         """
         channel = _make_channel(copy_threads=2)
-        started = threading.Barrier(3)  # 2 workers + main
-        release_gate = threading.Event()
-        finished = []
-
-        def slow_foreach(dst_slice, src_slice):
-            started.wait(timeout=2)
-            assert release_gate.wait(timeout=3)
-            finished.append(threading.current_thread().name)
-
-        monkeypatch.setattr(torch, "_foreach_copy_", slow_foreach)
+        copy = _ParkedCopy(num_workers=2)
+        monkeypatch.setattr(torch, "_foreach_copy_", copy)
 
         src = [torch.ones(8), torch.ones(8)]
         dst = [torch.zeros(8), torch.zeros(8)]
 
-        async def _cancel_twice():
+        async def _cancel_repeatedly():
             loop = asyncio.get_running_loop()
             task = asyncio.create_task(channel._async_h2h_copy(src, dst))
-            await loop.run_in_executor(None, lambda: started.wait(timeout=2))
-            for _ in range(3):
-                task.cancel()
-                await asyncio.sleep(0.02)
-            # Workers are provably still copying; the task must not be done.
-            assert not task.done(), "resumed before H2H workers were drained"
-            release_gate.set()
+            await loop.run_in_executor(None, copy.wait_until_all_inside)
+
+            # Cancel repeatedly, and keep checking across the whole window.
+            try:
+                for _ in range(3):
+                    task.cancel()
+                    await _assert_blocked_while_workers_live(task, copy, _OBSERVE_S / 3)
+            finally:
+                copy.release()
+
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert len(finished) == 2
+            assert len(copy.finished) == 2
+            assert copy.live_workers == 0
 
         try:
-            _run(_cancel_twice())
+            _run(_cancel_repeatedly())
         finally:
-            release_gate.set()
+            copy.release()
             channel._staging_copy_pool.shutdown(wait=True)
 
     def test_exception_in_one_slice_drains_siblings(self, monkeypatch):
@@ -147,7 +210,6 @@ class TestAsyncH2HCopyDrain:
         channel = _make_channel(copy_threads=2)
         sibling_started = threading.Event()
         sibling_done = threading.Event()
-        fail_gate = threading.Event()
         call_count = {"n": 0}
         lock = threading.Lock()
 
@@ -158,12 +220,11 @@ class TestAsyncH2HCopyDrain:
             if idx == 1:
                 sibling_started.set()
                 # Slow sibling — must finish before _async_h2h_copy raises.
-                time.sleep(0.2)
+                time.sleep(_SIBLING_COPY_S)
                 sibling_done.set()
                 return
             # Fast failing slice: wait until sibling has started, then raise.
-            assert sibling_started.wait(timeout=2)
-            fail_gate.set()
+            assert sibling_started.wait(timeout=_HOLD_TIMEOUT_S)
             raise RuntimeError("boom-slice")
 
         monkeypatch.setattr(torch, "_foreach_copy_", flaky_foreach)
@@ -174,7 +235,9 @@ class TestAsyncH2HCopyDrain:
         async def _run_copy():
             with pytest.raises(RuntimeError, match="boom-slice"):
                 await channel._async_h2h_copy(src, dst)
-            assert sibling_done.is_set()
+            assert sibling_done.is_set(), (
+                "error surfaced while the sibling slice was still copying"
+            )
 
         try:
             _run(_run_copy())

@@ -9,7 +9,8 @@ These rebind:
   LRU bookkeeping strictly best-effort so a single evicted key can never abort a
   lookup (see "Why touch_cache must not raise" below),
 * ``StorageManager.prefetch_all_done_callback`` -- mirror prefetched tiers into
-  the local hot cache when enabled (see ``patched_prefetch_all_done_callback``).
+  the local hot cache when enabled, with the same delay-pull proxy skip as
+  ``get`` / ``batched_get`` (see ``patched_prefetch_all_done_callback``).
 
 so the fixes live in the Ascend overlay instead of mutating the upstream
 LMCache tree.
@@ -188,6 +189,8 @@ def patched_prefetch_all_done_callback(
         EventType.LOADING, lookup_id, status=EventStatus.DONE
     )
 
+    # gather_with_keys() yields list[list[tuple[CacheEngineKey, MemoryObj]]]
+    # (see upstream StorageManager.async_lookup_and_prefetch).
     res = task.result()
 
     total_retrieved_chunks = 0
@@ -195,12 +198,17 @@ def patched_prefetch_all_done_callback(
         actual_chunks = len(tier_result)
         total_retrieved_chunks += actual_chunks
         if actual_chunks < tier_expected_chunks[tier_idx]:
+            # Unpack (key, mem_obj) pairs -- iterating bare tuples would raise
+            # AttributeError on ref_count_down and abort before we respond to
+            # the scheduler.
             for subsequent_tier in res[tier_idx + 1 :]:
-                for mem_obj in subsequent_tier:
+                for _, mem_obj in subsequent_tier:
                     mem_obj.ref_count_down()
             break
 
     # inject hotcache start ---------------------
+    # Mirror retrieved chunks into LocalCPUBackend for faster reuse, but skip
+    # delay-pull proxies (same guard as get/batched_get -- see module note).
     if (
         self.local_cpu_backend is not None
         and self.local_cpu_backend.use_hot
@@ -213,9 +221,11 @@ def patched_prefetch_all_done_callback(
             for key, mem_obj in tier_result:
                 if chunk_count >= total_retrieved_chunks:
                     break
+                chunk_count += 1
+                if getattr(mem_obj, "is_proxy", False):
+                    continue
                 tier_keys.append(key)
                 tier_objs.append(mem_obj)
-                chunk_count += 1
             if tier_keys:
                 self.local_cpu_backend.batched_submit_put_task(tier_keys, tier_objs)
             if chunk_count >= total_retrieved_chunks:

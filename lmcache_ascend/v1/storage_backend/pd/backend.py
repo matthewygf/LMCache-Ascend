@@ -181,7 +181,10 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
     def initialize_allocator(
         self, config: LMCacheEngineConfig, metadata: LMCacheMetadata
     ) -> PagedCpuGpuMemoryAllocator:
-        npu_corrected_device = get_correct_device("npu", metadata.worker_id)
+        # Prefer local_worker_id; get_correct_device also uses current_device
+        # when CreateNPUConnector / the framework already bound the process.
+        local_worker_id = getattr(metadata, "local_worker_id", metadata.worker_id)
+        npu_corrected_device = get_correct_device("npu", local_worker_id)
         logger.debug("Setting NPU device to %s", npu_corrected_device)
         torch.npu.set_device(npu_corrected_device)
 

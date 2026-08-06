@@ -1653,61 +1653,95 @@ class AscendP2PBackend(P2PBackend):
         read_success = False
         staging_objs: list[MemoryObj] = []
         try:
-            channel_transfer_spec = build_channel_transfer_spec(
-                target_peer_url,
-                remote_buffer_uuids,
-                remote_mem_indexes,
-            )
-            if self.use_host_staging and not self.delay_pull and not self.use_npu:
-                staging_objs = self.transfer_channel.allocate_receiver_staging(
-                    hit_mem_objs
+            try:
+                channel_transfer_spec = build_channel_transfer_spec(
+                    target_peer_url,
+                    remote_buffer_uuids,
+                    remote_mem_indexes,
                 )
-                if len(staging_objs) != len(hit_mem_objs):
-                    logger.warning(
-                        "Receiver host-staging arena could allocate only %d/%d "
-                        "slots for lookup_id %s; treating as miss.",
-                        len(staging_objs),
-                        len(hit_mem_objs),
-                        lookup_id,
+                if self.use_host_staging and not self.delay_pull and not self.use_npu:
+                    staging_objs = self.transfer_channel.allocate_receiver_staging(
+                        hit_mem_objs
                     )
+                    if len(staging_objs) != len(hit_mem_objs):
+                        logger.warning(
+                            "Receiver host-staging arena could allocate only %d/%d "
+                            "slots for lookup_id %s; treating as miss.",
+                            len(staging_objs),
+                            len(hit_mem_objs),
+                            lookup_id,
+                        )
+                    else:
+                        await self.transfer_channel.async_batched_read(
+                            buffers=staging_objs,
+                            transfer_spec=channel_transfer_spec,
+                        )
+                        await self.transfer_channel.copy_receiver_staging_to(
+                            staging_objs,
+                            hit_mem_objs,
+                        )
+                        read_success = True
                 else:
                     await self.transfer_channel.async_batched_read(
-                        buffers=staging_objs,
+                        buffers=hit_mem_objs,
                         transfer_spec=channel_transfer_spec,
                     )
-                    await self.transfer_channel.copy_receiver_staging_to(
-                        staging_objs,
-                        hit_mem_objs,
-                    )
                     read_success = True
-            else:
-                await self.transfer_channel.async_batched_read(
-                    buffers=hit_mem_objs,
-                    transfer_spec=channel_transfer_spec,
+            except Exception as e:
+                logger.error(
+                    "Error during P2P batched read operation for lookup_id %s: %s",
+                    lookup_id,
+                    e,
+                    exc_info=True,
                 )
-                read_success = True
-        except Exception as e:
-            logger.error(
-                "Error during P2P batched read operation for lookup_id %s: %s",
-                lookup_id,
-                e,
-                exc_info=True,
-            )
-            # Do not return yet — must send Done signal to server
+                # Do not return yet — must send Done signal to server
+            finally:
+                # Drain HCCL DMA before returning arena slots. Sync-get
+                # timeout cancels this coroutine during
+                # ``async_batched_read``'s poll loop (``CancelledError`` is
+                # not an ``Exception``); releasing staged pages while DMA
+                # may still write them UAFs the receiver arena on reuse.
+                if staging_objs:
+                    try:
+                        transport_stream = getattr(
+                            self.transfer_channel, "transport_stream", None
+                        )
+                        if transport_stream is not None:
+                            transport_stream.synchronize()
+                    except Exception as e:
+                        logger.error(
+                            "Failed to synchronize transport stream before "
+                            "releasing receiver host-staging for lookup_id %s: %s",
+                            lookup_id,
+                            e,
+                            exc_info=True,
+                        )
+                    try:
+                        self.transfer_channel.release_staged(staging_objs)
+                    except Exception as e:
+                        logger.error(
+                            "Failed to release receiver host-staging slots for "
+                            "lookup_id %s: %s",
+                            lookup_id,
+                            e,
+                            exc_info=True,
+                        )
         finally:
-            if staging_objs:
-                try:
-                    self.transfer_channel.release_staged(staging_objs)
-                except Exception as e:
-                    logger.error(
-                        "Failed to release receiver host-staging slots for "
-                        "lookup_id %s: %s",
-                        lookup_id,
-                        e,
-                        exc_info=True,
-                    )
-
-        await self._send_done_signal(lookup_id, target_peer_url)
+            # Always notify the producer, including on CancelledError after
+            # sync-get timeout. Otherwise pending_pull_resources stay pinned
+            # until TTL. shield() so Task.cancel() cannot abort the Done
+            # await while this finally runs.
+            try:
+                await asyncio.shield(
+                    self._send_done_signal(lookup_id, target_peer_url)
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to send P2P Done signal for lookup_id %s: %s",
+                    lookup_id,
+                    e,
+                    exc_info=True,
+                )
         return read_success
 
     async def batched_get_non_blocking(

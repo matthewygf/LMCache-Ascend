@@ -1090,6 +1090,25 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
                 # allocate_buffers itself fails.  Without this, an
                 # exception would leak NPU pages and leave the sender's
                 # pinned resources stuck until its TTL expires.
+                #
+                # Drain the HCCL transport stream *before* reclaiming
+                # buffers or sending Done. ``load_stream.synchronize()``
+                # alone is insufficient: a later micro-batch can raise
+                # (e.g. LeaseExpiredError) after ``submit_batched_read``
+                # enqueued DMA on ``transport_stream`` but before
+                # ``load_stream`` waited on that event. Releasing the
+                # ping-pong pool / sending Done in that window UAFs the
+                # consumer buffers and the producer's host-staging arena.
+                try:
+                    channel = proxy_items[0][0]._transfer_channel
+                    transport_stream = getattr(channel, "transport_stream", None)
+                    if transport_stream is not None:
+                        transport_stream.synchronize()
+                except Exception:
+                    logger.exception(
+                        "Failed to synchronize P2P transport stream before "
+                        "releasing ping-pong buffers; proceeding with cleanup."
+                    )
                 self.load_stream.synchronize()
                 if pool_a is not None:
                     first_ctx.release_buffers(pool_a)

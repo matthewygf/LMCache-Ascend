@@ -1467,6 +1467,76 @@ class TestAscendP2PBackendUnit:
             "lu_lease", "target_peer_url"
         )
 
+    def test_handle_pull_mode_transfer_cancel_drains_transport_before_release(
+        self, async_loop
+    ):
+        """Cancelled eager host-staging pull must not freelist pages under DMA.
+
+        Sync-get timeout cancels ``_handle_pull_mode_transfer`` during
+        ``async_batched_read``'s poll loop. ``CancelledError`` is not an
+        ``Exception``, so cleanup must still synchronize the transport
+        stream before ``release_staged`` and still send Done.
+        """
+        backend = MagicMock()
+        backend.loop = async_loop
+        backend.use_host_staging = True
+        backend.delay_pull = False
+        backend.use_npu = False
+        backend._pull_lease_guard_s = 15.0
+
+        call_order: list[str] = []
+        transport_stream = MagicMock()
+        transport_stream.synchronize.side_effect = lambda: call_order.append(
+            "transport_sync"
+        )
+
+        backend.transfer_channel = MagicMock()
+        backend.transfer_channel.transport_stream = transport_stream
+
+        async def cancel_during_read(**_kwargs):
+            call_order.append("read")
+            raise asyncio.CancelledError()
+
+        backend.transfer_channel.async_batched_read = AsyncMock(
+            side_effect=cancel_during_read
+        )
+        backend.transfer_channel.copy_receiver_staging_to = AsyncMock()
+        backend.transfer_channel.release_staged = MagicMock(
+            side_effect=lambda _objs: call_order.append("release")
+        )
+
+        async def send_done(*_args):
+            call_order.append("done")
+
+        backend._send_done_signal = AsyncMock(side_effect=send_done)
+
+        final_objs = [_make_mock_mem_obj()]
+        staging_objs = [_make_mock_mem_obj()]
+        backend.transfer_channel.allocate_receiver_staging.return_value = staging_objs
+
+        # First Party
+        from lmcache_ascend.v1.storage_backend.p2p_backend import AscendP2PBackend
+
+        with pytest.raises(asyncio.CancelledError):
+            _run_coroutine(
+                async_loop,
+                AscendP2PBackend._handle_pull_mode_transfer(
+                    backend,
+                    "lu_cancel",
+                    "target_peer_url",
+                    final_objs,
+                    ["ruuid-0"],
+                    [10],
+                    lease_ttl_s=60.0,
+                ),
+            )
+
+        assert call_order == ["read", "transport_sync", "release", "done"]
+        backend.transfer_channel.release_staged.assert_called_once_with(staging_objs)
+        backend._send_done_signal.assert_awaited_once_with(
+            "lu_cancel", "target_peer_url"
+        )
+
     def test_batched_get_non_blocking_host_staging_cpu_pull(self, async_loop):
         """Host-staging CPU eager pull skips final CPU refs and returns CPU objs."""
         backend = _make_p2p_backend_stub(

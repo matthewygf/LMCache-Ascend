@@ -187,7 +187,9 @@ class AscendLMCacheEngine(LMCacheEngine):
         dtypes = self.metadata.get_dtypes()
         per_chunk_bytes = get_size_bytes(shapes, dtypes)
 
-        device = self.metadata.worker_id
+        # Use the process-bound NPU (set by CreateNPUConnector / vLLM),
+        # not metadata.worker_id which is the global rank on multi-node.
+        device = torch.npu.current_device()
         props = torch.npu.get_device_properties(device)
         total_mem = props.total_memory
         allocated = torch.npu.memory_allocated(device)
@@ -518,18 +520,26 @@ class AscendLMCacheEngine(LMCacheEngine):
         meta_table = plan["meta"]
         shard_plan = plan["shard_plan"]
         shard_layouts = plan["shard_layouts"]
-        device = f"npu:{self.metadata.worker_id}"
-        if not self._ensure_merged_pool(plan["max_shard_bytes"], device):
-            raise RuntimeError(
-                f"Failed to allocate merged broadcast pool on {device} "
-                f"({plan['max_shard_bytes']} bytes/slot). "
-                "Consider reducing broadcast_shard_size."
-            )
+        # Match broadcast_stream / load_stream: bind to the process NPU
+        # (CreateNPUConnector already set_device). Do not use
+        # metadata.worker_id — that is the global rank on multi-node.
+        device = f"npu:{torch.npu.current_device()}"
 
         pending: List[Tuple[List[MemoryObj], torch.npu.Event]] = []
 
         prev_ctx = None
         try:
+            # Allocate inside try so sender CPU mem_objs are always
+            # released in finally even when pool creation fails.
+            # (retrieve() skips ref_count_down for the first rank when
+            # save_only_first_rank is set, assuming this pipeline owns them.)
+            if not self._ensure_merged_pool(plan["max_shard_bytes"], device):
+                raise RuntimeError(
+                    f"Failed to allocate merged broadcast pool on {device} "
+                    f"({plan['max_shard_bytes']} bytes/slot). "
+                    "Consider reducing broadcast_shard_size."
+                )
+
             for shard_idx, _ in enumerate(shard_plan):
                 layout = shard_layouts[shard_idx]
                 slot = shard_idx % 2
@@ -576,7 +586,16 @@ class AscendLMCacheEngine(LMCacheEngine):
                 self._submit_togpu(prev_ctx, load_stream, pending, **kwargs)
 
         finally:
-            load_stream.synchronize()
+            # load_stream may not have been used if pool alloc failed.
+            try:
+                load_stream.synchronize()
+            except Exception:
+                logger.error(
+                    "rank=%d failed to synchronize load_stream during "
+                    "sharded broadcast cleanup",
+                    self.metadata.worker_id,
+                    exc_info=True,
+                )
             for objs, _ in pending:
                 for obj in objs:
                     try:

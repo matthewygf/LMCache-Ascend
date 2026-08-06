@@ -37,6 +37,7 @@ def _make_engine(monkeypatch, *, total_mem, allocated, per_chunk_bytes):
     )
 
     # --- Patch torch.npu device APIs ---
+    monkeypatch.setattr(ce_mod.torch.npu, "current_device", lambda: 0)
     fake_props = SimpleNamespace(total_memory=total_mem)
     monkeypatch.setattr(
         ce_mod.torch.npu,
@@ -129,6 +130,36 @@ class TestEstimateShardSize:
         )
         with pytest.raises(RuntimeError, match="Invalid per-chunk size"):
             engine._estimate_shard_size()
+
+    def test_queries_current_device_not_global_rank(self, monkeypatch):
+        """Memory queries must use torch.npu.current_device(), not worker_id."""
+        # First Party
+        from lmcache_ascend.v1 import cache_engine as ce_mod
+
+        engine = _make_engine(
+            monkeypatch,
+            total_mem=80 * GB,
+            allocated=30 * GB,
+            per_chunk_bytes=10 * MB,
+        )
+        engine.metadata.worker_id = 9
+        monkeypatch.setattr(ce_mod.torch.npu, "current_device", lambda: 1)
+
+        queried = []
+
+        def _props(device):
+            queried.append(("props", device))
+            return SimpleNamespace(total_memory=80 * GB)
+
+        def _alloc(device):
+            queried.append(("alloc", device))
+            return 30 * GB
+
+        monkeypatch.setattr(ce_mod.torch.npu, "get_device_properties", _props)
+        monkeypatch.setattr(ce_mod.torch.npu, "memory_allocated", _alloc)
+
+        assert engine._estimate_shard_size() == 16
+        assert queried == [("props", 1), ("alloc", 1)]
 
     @pytest.mark.parametrize(
         "total,alloc,per_chunk,expected",

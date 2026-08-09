@@ -1,4 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Unit tests for Ascend ``handle_preemptions`` across vLLM API shapes.
+
+vLLM ≤0.18 passes ``set[str]`` request ids. vLLM ≥0.23 always passes
+``KVConnectorMetadata`` (with ``preempted_req_ids`` attached by Ascend's
+``build_connector_meta``). Both shapes must drain async stores / unpin
+lookups without raising.
+"""
+
 # Standard
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -54,6 +62,19 @@ def test_lmcache_connector_preemption_patch_handles_no_inner_impl():
     connector.handle_preemptions({"req-1"})
 
 
+def test_lmcache_connector_preemption_patch_accepts_metadata():
+    """vLLM ≥0.23 passes connector metadata, not a bare set."""
+    LMCacheConnectorV1 = _import_and_patch_vllm_connector()
+
+    connector = object.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = MagicMock()
+
+    metadata = SimpleNamespace(preempted_req_ids={"req-meta"})
+    connector.handle_preemptions(metadata)
+
+    connector._lmcache_engine.handle_preemptions.assert_called_once_with(metadata)
+
+
 def test_ascend_adapter_drains_pending_stores_for_async_producer():
     """Async non-consumer workers must drain pending stores before reuse."""
     pytest.importorskip("lmcache")
@@ -73,6 +94,84 @@ def test_ascend_adapter_drains_pending_stores_for_async_producer():
     adapter.handle_preemptions(preempted_req_ids)
 
     lmcache_engine.wait_for_pending_stores.assert_called_once_with(preempted_req_ids)
+
+
+def test_ascend_adapter_drains_from_metadata_preempted_req_ids():
+    """Metadata-shaped calls (vLLM ≥0.23) must extract and drain preempted ids."""
+    pytest.importorskip("lmcache")
+    pytest.importorskip("vllm")
+    adapter_mod = pytest.importorskip("lmcache_ascend.integration.vllm.vllm_v1_adapter")
+
+    lmcache_engine = MagicMock()
+    lmcache_engine.wait_for_pending_stores.return_value = {"req-9"}
+    adapter = _make_adapter(
+        adapter_mod,
+        store_async=True,
+        kv_role="kv_both",
+        lmcache_engine=lmcache_engine,
+    )
+
+    metadata = SimpleNamespace(preempted_req_ids={"req-9"})
+    adapter.handle_preemptions(metadata)
+
+    lmcache_engine.lookup_unpin.assert_called_once_with("req-9")
+    lmcache_engine.wait_for_pending_stores.assert_called_once_with({"req-9"})
+
+
+def test_ascend_adapter_metadata_without_preempted_ids_is_noop():
+    """Empty / missing preempted ids must not raise or unpin."""
+    pytest.importorskip("lmcache")
+    pytest.importorskip("vllm")
+    adapter_mod = pytest.importorskip("lmcache_ascend.integration.vllm.vllm_v1_adapter")
+
+    lmcache_engine = MagicMock()
+    adapter = _make_adapter(
+        adapter_mod,
+        store_async=True,
+        kv_role="kv_both",
+        lmcache_engine=lmcache_engine,
+    )
+
+    # Upstream LMCache metadata historically had no preempted_req_ids attr.
+    adapter.handle_preemptions(SimpleNamespace(requests=[]))
+
+    lmcache_engine.lookup_unpin.assert_not_called()
+    lmcache_engine.wait_for_pending_stores.assert_not_called()
+
+
+def test_extract_preempted_req_ids_shapes():
+    adapter_mod = pytest.importorskip("lmcache_ascend.integration.vllm.vllm_v1_adapter")
+    extract = adapter_mod._extract_preempted_req_ids
+
+    assert extract({"a", "b"}) == {"a", "b"}
+    assert extract(["a"]) == {"a"}
+    assert extract(SimpleNamespace(preempted_req_ids={"z"})) == {"z"}
+    assert extract(SimpleNamespace(requests=[])) == set()
+
+
+def test_build_connector_meta_attaches_preempted_req_ids(monkeypatch):
+    """Ascend build_connector_meta must copy scheduler preempted ids onto meta."""
+    pytest.importorskip("lmcache")
+    pytest.importorskip("vllm")
+    adapter_mod = pytest.importorskip("lmcache_ascend.integration.vllm.vllm_v1_adapter")
+
+    base_meta = SimpleNamespace()
+    adapter = object.__new__(adapter_mod.LMCacheAscendConnectorV1Impl)
+
+    def _fake_super_build(_self, _scheduler_output):
+        return base_meta
+
+    monkeypatch.setattr(
+        adapter_mod.LMCacheConnectorV1Impl,
+        "build_connector_meta",
+        _fake_super_build,
+    )
+
+    scheduler_output = SimpleNamespace(preempted_req_ids={"p1", "p2"})
+    meta = adapter.build_connector_meta(scheduler_output)
+
+    assert meta is base_meta
+    assert meta.preempted_req_ids == {"p1", "p2"}
 
 
 @pytest.mark.parametrize(

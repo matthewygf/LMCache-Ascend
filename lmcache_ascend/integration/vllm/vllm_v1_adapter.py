@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 # Third Party
 from lmcache.integration.vllm.vllm_v1_adapter import (
@@ -14,6 +14,7 @@ from vllm.config import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
+    KVConnectorMetadata,
     KVConnectorRole,
 )
 from vllm.distributed.parallel_state import get_pp_group
@@ -23,9 +24,30 @@ import torch
 if TYPE_CHECKING:
     # Third Party
     from vllm.forward_context import ForwardContext
+    from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _extract_preempted_req_ids(
+    preempted: Union[set[str], frozenset, list, tuple, KVConnectorMetadata, Any],
+) -> set[str]:
+    """Normalize vLLM ``handle_preemptions`` arguments across versions.
+
+    * vLLM ≤0.18 (and Ascend unit tests) pass ``set[str]`` request ids.
+    * vLLM ≥0.23 always passes ``KVConnectorMetadata``; preempted ids are
+      attached by :meth:`LMCacheAscendConnectorV1Impl.build_connector_meta`
+      as ``preempted_req_ids``.
+    """
+    if isinstance(preempted, (set, frozenset)):
+        return set(preempted)
+    if isinstance(preempted, (list, tuple)):
+        return set(preempted)
+    preempted_req_ids = getattr(preempted, "preempted_req_ids", None)
+    if preempted_req_ids is None:
+        return set()
+    return set(preempted_req_ids)
 
 
 class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
@@ -366,8 +388,29 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             None,
         )
 
-    def handle_preemptions(self, preempted_req_ids: set[str]) -> None:
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> KVConnectorMetadata:
+        """Build connector metadata and attach preempted request ids.
+
+        vLLM ≥0.23 invokes ``handle_preemptions(kv_connector_metadata)`` on
+        every step. Upstream LMCache metadata does not carry preempted ids,
+        so Ascend copies ``scheduler_output.preempted_req_ids`` onto the
+        metadata object for the worker-side drain path.
+        """
+        meta = super().build_connector_meta(scheduler_output)
+        meta.preempted_req_ids = set(scheduler_output.preempted_req_ids or ())
+        return meta
+
+    def handle_preemptions(
+        self,
+        preempted: Union[set[str], frozenset, list, tuple, KVConnectorMetadata, Any],
+    ) -> None:
         if self.lmcache_engine is None:
+            return
+
+        preempted_req_ids = _extract_preempted_req_ids(preempted)
+        if not preempted_req_ids:
             return
 
         logger.debug(

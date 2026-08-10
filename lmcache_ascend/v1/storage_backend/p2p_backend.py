@@ -1048,11 +1048,17 @@ class AscendP2PBackend(P2PBackend):
                         # Store mem_objs to prevent premature release.
                         # Record the timestamp so the TTL sweep can detect
                         # stale entries if the peer never sends Done.
+                        # Propagate the same TTL as lease_ttl_s so delay-pull
+                        # consumers can check_lease() before one-sided reads;
+                        # without it (lease_ttl_s=0) a >TTL hold after async
+                        # prefetch can RDMA from pages the sweep already
+                        # unpinned/freed.
                         self.pending_pull_resources[lookup_id] = (
                             self.loop.time(),
                             mem_objs,
                         )
                         should_release = False
+                        lease_ttl_s = self._pull_pending_ttl
                 else:
                     logger.debug(
                         "Pull mode enabled but no hit chunks "

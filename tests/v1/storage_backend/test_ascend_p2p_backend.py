@@ -335,6 +335,7 @@ class TestAscendP2PBackendUnit:
         backend = MagicMock()
         backend.loop = async_loop
         backend.use_host_staging = False
+        backend._pull_pending_ttl = 60.0
         backend.chunk_size = 256
         backend.transfer_channel = MagicMock()
         backend.transfer_channel.remote_xfer_handler_exists.return_value = True
@@ -373,6 +374,9 @@ class TestAscendP2PBackendUnit:
         assert ret.num_hit_chunks == 1
         assert ret.remote_buffer_uuids == ["server-uuid"]
         assert ret.remote_mem_indexes == [42]
+        # Non-host-staging pull must advertise the producer TTL as a lease so
+        # delay-pull consumers can refuse reads after the sweep unpins.
+        assert ret.lease_ttl_s == backend._pull_pending_ttl
         # Should NOT have called batched_write in pull mode
         backend.transfer_channel.async_batched_write.assert_not_awaited()
         # Should have stored pending resources

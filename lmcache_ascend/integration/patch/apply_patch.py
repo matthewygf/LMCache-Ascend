@@ -26,10 +26,14 @@ def run_integration_patches():
     ]
 
     if is_310p():
+        # Module file is vllm_ascend_310p_adapt_patch.py (class keeps the
+        # VllmAscend0100rc1Patcher name). The old
+        # vllm_ascend_0_10_0_rc1_310p_patch path never existed, so the NZ
+        # format fix for LMCache + vllm-ascend 0.10.0rc1 never loaded.
         patch_tasks.append(
             (
                 "vllm_ascend",
-                f"{base_path}.vllm.vllm_ascend_0_10_0_rc1_310p_patch",
+                f"{base_path}.vllm.vllm_ascend_310p_adapt_patch",
                 "VllmAscend0100rc1Patcher",
             )
         )

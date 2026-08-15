@@ -383,38 +383,56 @@ def _patch_remote_backend():
     from lmcache.v1.memory_management import MemoryObj
     from lmcache.v1.storage_backend.naive_serde import CacheGenDeserializer
     from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+    import torch
 
-    # The core remote backend implementation deserializes an NPU resident tensor that
-    # isn't managed by a parent allocator. To mesh with the rest of LMCache it needs to
-    # be a host registered CPU tensor.
-    #
-    # Patch the get function with that functionality - allocate managed CPU memory,
-    # copy over the data
+    # First Party
+    from lmcache_ascend.v1.storage_backend.remote_cachegen import (
+        relocate_cachegen_bufs_to_host,
+    )
+
+    # CacheGenDeserializer returns unmanaged NPU tensors. Relocate them into
+    # allocator-managed host buffers and synchronize before return so the
+    # subsequent load_stream H2D cannot race the non_blocking D2H.
     old_batched_get_blocking = RemoteBackend.batched_get_blocking
+    old_get_blocking = RemoteBackend.get_blocking
+
+    def _sync_after_d2h() -> None:
+        if hasattr(torch, "npu"):
+            torch.npu.synchronize()
+        else:
+            torch.cuda.synchronize()
+
+    def new_get_blocking(
+        self,
+        key: CacheEngineKey,
+    ) -> Optional[MemoryObj]:
+        source_buf = old_get_blocking(self, key)
+        if not isinstance(self.deserializer, CacheGenDeserializer):
+            return source_buf
+        # Keep source_buf referenced until relocate returns (post-sync).
+        return relocate_cachegen_bufs_to_host(
+            self.get_allocator_backend(),
+            [source_buf],
+            _sync_after_d2h,
+        )[0]
 
     def new_batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
     ) -> List[Optional[MemoryObj]]:
         source_bufs = old_batched_get_blocking(self, keys)
+        if not isinstance(self.deserializer, CacheGenDeserializer):
+            return source_bufs
+        # Keep source_bufs referenced until relocate returns (post-sync).
+        return relocate_cachegen_bufs_to_host(
+            self.get_allocator_backend(),
+            source_bufs,
+            _sync_after_d2h,
+        )
 
-        if isinstance(self.deserializer, CacheGenDeserializer):
-            allocator = self.get_allocator_backend()
-
-            target_bufs = []
-            for source_buf in source_bufs:
-                shape = source_buf.tensor.shape
-                dtype = source_buf.tensor.dtype
-
-                target_buf = allocator.allocate(shape, dtype)
-                target_buf.tensor.copy_(source_buf.tensor, non_blocking=True)
-                target_bufs.append(target_buf)
-        else:
-            target_bufs = source_bufs
-
-        return target_bufs
-
+    RemoteBackend.get_blocking = new_get_blocking
     RemoteBackend.batched_get_blocking = new_batched_get_blocking
+
 
 
 def _patch_multi_process():

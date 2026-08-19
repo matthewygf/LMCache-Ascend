@@ -546,6 +546,89 @@ class TestAscendPDBackend:
             "sender_1", "pull_delay_done_once"
         )
 
+    def test_pull_delay_overlapping_keys_do_not_decref_existing_proxies(self):
+        """Second PullReady for the same keys must not Done the first transfer.
+
+        ``_contains_and_pin`` + ``release_pin_refs`` used to call
+        ``ProxyMemoryObj.ref_count_down`` on already-present proxies. That
+        decrefs the first request's ``PDTransferContext`` and can send Done
+        while its connector is still RDMA-reading — a UAF / wrong-KV race
+        under concurrent shared-prefix delay-pull.
+        """
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.receiver_mixin import (
+            AscendPDReceiverMixin,
+        )
+
+        backend = _make_pd_backend_stub(
+            delay_pull=True,
+            buffer_device="npu",
+            kv_shape=DEFAULT_SHAPE,
+            kv_dtype=torch.bfloat16,
+            chunk_size=256,
+            pull_mode=True,
+            use_cpu_offload=True,
+        )
+        backend._send_pull_done_to_sender = MagicMock()
+
+        def _put(key, obj):
+            backend.data[key] = obj
+
+        backend.put = _put
+
+        keys = [_make_key("shared_a"), _make_key("shared_b")]
+        key_strs = [k.to_string() for k in keys]
+
+        first_msg = PullReadyNotif(
+            pull_id="pull_r1",
+            keys=key_strs,
+            sender_buffer_uuids=["suuid-0", "suuid-1"],
+            sender_mem_indexes=[0, 1],
+            sender_id="sender_1",
+            sender_done_url="tcp://sender:9999",
+            fmt=MemoryFormat.KV_2LTD.value,
+            shape=[2, 2, 256, 512],
+            dtype="bfloat16",
+            last_chunk_toks=256,
+        )
+        ack1, _ = AscendPDReceiverMixin._handle_pull_delay(
+            backend, first_msg, "sender_1"
+        )
+        assert ack1.already_sent_indexes == []
+        assert set(backend.data.keys()) == set(keys)
+
+        first_proxies = [backend.data[k] for k in keys]
+        first_ctx = first_proxies[0].transfer_context
+        assert all(p.transfer_context is first_ctx for p in first_proxies)
+        assert first_ctx._ref_count == 2
+        assert first_ctx._done_sent is False
+
+        second_msg = PullReadyNotif(
+            pull_id="pull_r2",
+            keys=key_strs,
+            sender_buffer_uuids=["suuid-10", "suuid-11"],
+            sender_mem_indexes=[10, 11],
+            sender_id="sender_1",
+            sender_done_url="tcp://sender:9999",
+            fmt=MemoryFormat.KV_2LTD.value,
+            shape=[2, 2, 256, 512],
+            dtype="bfloat16",
+            last_chunk_toks=256,
+        )
+        ack2, _ = AscendPDReceiverMixin._handle_pull_delay(
+            backend, second_msg, "sender_1"
+        )
+
+        assert sorted(ack2.already_sent_indexes) == [0, 1]
+        # First transfer must remain live: no premature Done / decref.
+        assert first_ctx._ref_count == 2
+        assert first_ctx._done_sent is False
+        assert all(not p._released for p in first_proxies)
+        backend._send_pull_done_to_sender.assert_not_called()
+        # Proxies in data are still the first request's objects.
+        assert backend.data[keys[0]] is first_proxies[0]
+        assert backend.data[keys[1]] is first_proxies[1]
+
     def test_proxy_submit_resolve_batch_fallback_uses_sync_batched_read(self):
         """No submit_batched_read: fallback uses synchronous batched_read."""
 

@@ -54,6 +54,24 @@ def release_memory_objects(
             mem_obj.unpin()
 
 
+def release_pin_refs(mem_objs: List[MemoryObj]) -> None:
+    """Undo ``_contains_and_pin`` without destroying delay-pull proxies.
+
+    ``ProxyMemoryObj.ref_count_up`` is a no-op (proxy lifetime is owned by
+    the transfer context), but ``ref_count_down`` calls ``decref()`` and can
+    send Done to the sender. Treating an already-present proxy as a normal
+    pinned ``MemoryObj`` therefore races a concurrent retrieve: a second
+    ``PullReadyNotif`` for overlapping keys would release the first request's
+    remote pins while its connector still RDMA-reads them.
+
+    Skip proxies here; only real ``MemoryObj`` pins need ``ref_count_down``.
+    """
+    for mem_obj in mem_objs:
+        if getattr(mem_obj, "is_proxy", False):
+            continue
+        mem_obj.ref_count_down()
+
+
 def allocate_with_retry(
     allocate_fn: Callable[..., Optional[MemoryObj]],
     shape: torch.Size,

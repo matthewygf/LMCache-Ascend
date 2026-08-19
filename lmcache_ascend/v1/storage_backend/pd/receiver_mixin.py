@@ -34,6 +34,7 @@ from lmcache_ascend.v1.storage_backend.utils import (
     allocate_with_retry,
     build_channel_transfer_spec,
     release_memory_objects,
+    release_pin_refs,
 )
 from lmcache_ascend.v1.transfer_context import PDTransferContext
 
@@ -109,7 +110,8 @@ class AscendPDReceiverMixin:
                 with self.data_lock:
                     for k in allocated_keys:
                         self.data.pop(k, None)
-                release_memory_objects(allocated_objs + already_sent_objs)
+                release_memory_objects(allocated_objs)
+                release_pin_refs(already_sent_objs)
                 return AscendAllocResponse(
                     already_sent_indexes=already_sent_indexes,
                     remote_buffer_uuids=[],
@@ -125,7 +127,7 @@ class AscendPDReceiverMixin:
             allocated_keys.append(key)
             allocated_objs.append(mem_obj)
 
-        release_memory_objects(already_sent_objs)
+        release_pin_refs(already_sent_objs)
 
         return AscendAllocResponse(
             already_sent_indexes=already_sent_indexes,
@@ -204,8 +206,9 @@ class AscendPDReceiverMixin:
                     total_allocs,
                     len(mem_objs),
                 )
-                # release the mem objs + sent
-                release_memory_objects(mem_objs + already_sent_objs)
+                # release the mem objs + unpin already-sent (skip proxies)
+                release_memory_objects(mem_objs)
+                release_pin_refs(already_sent_objs)
                 return (
                     PullReadyDoneAck(
                         already_sent_indexes=already_sent_indexes,
@@ -234,7 +237,7 @@ class AscendPDReceiverMixin:
         for mem_obj, key in zip(mem_objs, mem_keys, strict=False):
             self.put(key, mem_obj)
 
-        release_memory_objects(already_sent_objs)
+        release_pin_refs(already_sent_objs)
 
         # Build a callback that sends PullDoneSignal AFTER the ack reply
         # has been sent on the REP socket.  This prevents the sender's
@@ -343,7 +346,8 @@ class AscendPDReceiverMixin:
                 sender_id,
             )
 
-        release_memory_objects(already_sent_objs)
+        # Pin was a no-op for proxies; must not decref/Done them here.
+        release_pin_refs(already_sent_objs)
 
         return PullReadyDoneAck(already_sent_indexes=already_sent_indexes), None
 

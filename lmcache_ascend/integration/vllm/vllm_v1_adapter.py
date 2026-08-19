@@ -41,6 +41,10 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         self._wait_for_save_done = True
         self._finished_req_ids_waiting_for_save: set[str] = set()
         self._late_finished_sending: set[str] = set()
+        # Reqained in start_load_kv for invalid-block marking, retained until
+        # wait_for_save so soft-failed remote pulls are not persisted to LocalCPU
+        # (vLLM reports load errors only after wait_for_save).
+        self._failed_load_req_ids_pending_save: set[str] = set()
         logger.debug("store_async: %s", self.store_async)
 
     @_lmcache_nvtx_annotate
@@ -58,6 +62,12 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         failed_req_ids = drain()
         if not failed_req_ids:
             return
+
+        # Keep ids across forward → wait_for_save. vLLM only consumes
+        # get_block_ids_with_load_errors() after wait_for_save, so a same-step
+        # _local_persist_skip would otherwise D2H unfilled/partial NPU pages
+        # into LocalCPU and poison later local hits.
+        self._failed_load_req_ids_pending_save.update(failed_req_ids)
 
         metadata = self._parent._get_connector_metadata()
         if not isinstance(metadata, LMCacheConnectorMetadata):
@@ -109,6 +119,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
             if self.lmcache_engine is not None:
                 for request in connector_metadata.requests:
                     self.lmcache_engine.lookup_unpin(request.req_id)
+            self._failed_load_req_ids_pending_save.clear()
             self._wait_for_save_done = True
             return
 
@@ -121,6 +132,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         if self.lmcache_engine is not None and self.lmcache_engine._is_passive():
             for request in connector_metadata.requests:
                 self.lmcache_engine.lookup_unpin(request.req_id)
+            self._failed_load_req_ids_pending_save.clear()
             self._wait_for_save_done = True
             self._replay_finished_stores_after_save()
             return
@@ -137,6 +149,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 if layerwise_storer is not None:
                     next(layerwise_storer)
                 self.lmcache_engine.lookup_unpin(request.req_id)
+            self._failed_load_req_ids_pending_save.clear()
             self._wait_for_save_done = True
             self._replay_finished_stores_after_save()
             return
@@ -151,6 +164,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         ordering_event.record()
         # lmcache-ascend end ---------------------
 
+        failed_loads = self._failed_load_req_ids_pending_save
         for request in connector_metadata.requests:
             self.lmcache_engine.lookup_unpin(request.req_id)
 
@@ -167,7 +181,22 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 # Re-derive how many leading tokens are *already local* and, if
                 # a remote-loaded prefix is missing locally, persist it into the
                 # local backend so later hits stay local.
-                persist_remote_skip = self._local_persist_skip(request, token_ids)
+                #
+                # Soft-failed P2P/PD pulls must not take this path: NPU pages for
+                # the "loaded" prefix were never correctly filled, and vLLM only
+                # reschedules recompute after wait_for_save returns invalid
+                # blocks. Persisting them would poison LocalCPU.
+                if request.req_id in failed_loads:
+                    persist_remote_skip = None
+                    logger.warning(
+                        "Skipping local persist of remote-loaded prefix for "
+                        "req %s after soft-failed P2P/PD pull",
+                        request.req_id,
+                    )
+                else:
+                    persist_remote_skip = self._local_persist_skip(
+                        request, token_ids
+                    )
                 # lmcache-ascend end ----------------------------------------
 
                 if (
@@ -257,6 +286,7 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
                 )
                 continue
 
+        self._failed_load_req_ids_pending_save.clear()
         self._wait_for_save_done = True
         self._replay_finished_stores_after_save()
 

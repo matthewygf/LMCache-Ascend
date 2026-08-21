@@ -487,6 +487,11 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
                     skip_leading_tokens = 0
 
                 if skip_leading_tokens == len(token_ids):
+                    # No tokens left to store, so the transfer path that
+                    # normally carries the PD completion signal is skipped.
+                    # discard_partial_chunks truncates a sub-chunk prompt to
+                    # zero tokens, which lands here on the very first prefill.
+                    self._notify_pd_prefill_done(request)
                     continue
                 skip_leading_tokens = (
                     skip_leading_tokens
@@ -569,10 +574,33 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1ImplMultiGroup):
                     "wait_for_save failed for request %s; skipping save",
                     request.req_id,
                 )
+                # A failed save must still release the proxy. If the transfer
+                # already signaled, the sender drops this as a duplicate.
+                self._notify_pd_prefill_done(request)
                 continue
 
         self._wait_for_save_done = True
         self._replay_finished_stores_after_save()
+
+    def _notify_pd_prefill_done(self, request) -> None:
+        """Release the PD proxy for a request whose save loop stored nothing.
+
+        ``wait_decode_kv_ready`` on the proxy has no timeout, so a last-prefill
+        request that never reaches the chunk-transfer path hangs that
+        connection indefinitely. Marking the spec first keeps the engine-side
+        check consistent with the normal store path.
+        """
+        disagg_spec = getattr(request, "disagg_spec", None)
+        if disagg_spec is None or not request.is_last_prefill:
+            return
+        disagg_spec.is_last_prefill = True
+        try:
+            self.lmcache_engine.notify_pd_prefill_done(disagg_spec)
+        except Exception:
+            logger.exception(
+                "Failed to signal PD prefill done for request %s",
+                request.req_id,
+            )
 
     def _local_persist_skip(self, request, token_ids) -> Optional[int]:
         """Decide whether a remote-loaded prefix must be persisted locally.

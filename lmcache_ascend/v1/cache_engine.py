@@ -783,6 +783,34 @@ class AscendLMCacheEngine(LMCacheEngine):
                     self._store_cv.notify_all()
                 self._store_queue.task_done()
 
+    def notify_pd_prefill_done(self, transfer_spec) -> None:
+        """Report PD prefill completion for a request that transfers no chunks.
+
+        The proxy blocks on one notification per active rank with no timeout,
+        and that notification is normally emitted as part of a chunk transfer.
+        A prefill that produces no chunks at all -- a prompt shorter than
+        ``chunk_size`` under ``discard_partial_chunks``, an already-saved
+        prefix, or an allocation failure -- would otherwise never report in.
+
+        Passive ranks stay silent: under ``save_only_first_rank`` only the
+        first rank stores, so only it is counted by the proxy.
+        """
+        if transfer_spec is None or not getattr(
+            transfer_spec, "is_last_prefill", False
+        ):
+            return
+        if self._is_passive() or self.storage_manager is None:
+            return
+        backend = self.storage_manager.storage_backends.get("PDBackend")
+        notify = getattr(backend, "notify_prefill_done", None)
+        if notify is None:
+            return
+        logger.debug(
+            "No KV chunk to transfer for req %s; signaling PD prefill done.",
+            transfer_spec.req_id,
+        )
+        notify(transfer_spec.req_id)
+
     @torch.inference_mode()
     def _run_store_pipeline(
         self,
@@ -815,6 +843,7 @@ class AscendLMCacheEngine(LMCacheEngine):
                 "Freeze mode enabled, skipping store operation for %d tokens",
                 num_to_store_tokens,
             )
+            self.notify_pd_prefill_done(kwargs.get("transfer_spec"))
             return
 
         starts: List[int] = []
@@ -903,6 +932,7 @@ class AscendLMCacheEngine(LMCacheEngine):
 
         # memory_objs might be empty, directly return to avoid sending tokens
         if not memory_objs:
+            self.notify_pd_prefill_done(kwargs.get("transfer_spec"))
             return
 
         put_submitted = False

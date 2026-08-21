@@ -6,6 +6,7 @@ backpressure management, pull-done listener, and circuit breaker logic.
 """
 
 # Standard
+from collections import OrderedDict
 from typing import Any, List, Sequence
 import threading
 import time
@@ -35,6 +36,9 @@ from lmcache_ascend.v1.storage_backend.utils import (
 
 logger = init_logger(__name__)
 
+# Upper bound on remembered req_ids for prefill-done deduplication.
+_PREFILL_DONE_HISTORY = 8192
+
 
 class AscendPDSenderMixin:
     """Mixin providing sender/prefiller methods for :class:`AscendPDBackend`.
@@ -51,6 +55,12 @@ class AscendPDSenderMixin:
     def _init_sender(self):
         """Extend sender init with a Done-listener for pull mode."""
         super()._init_sender()
+
+        # Prefill-done bookkeeping. The proxy blocks until it has seen one
+        # ProxyNotif per expected TP rank, so each rank must emit exactly one
+        # per request no matter which code path completes the prefill.
+        self._prefill_done_notified: "OrderedDict[str, None]" = OrderedDict()
+        self._prefill_done_lock = threading.Lock()
 
         if self.pull_mode:
             # The sender binds a ZMQ PULL socket for receiving
@@ -345,6 +355,35 @@ class AscendPDSenderMixin:
         )
         return alloc_response
 
+    def notify_prefill_done(self, req_id: str) -> None:
+        """Tell the proxy that this rank has finished prefilling *req_id*.
+
+        The proxy's ``wait_decode_kv_ready`` blocks until it has received one
+        notification per expected TP rank, with no timeout, so a request that
+        never notifies wedges that connection forever. Requests that transfer
+        no chunks at all still have to report in: under
+        ``discard_partial_chunks`` a prompt shorter than ``chunk_size`` is
+        truncated to zero tokens and never reaches the transfer path.
+
+        Repeat calls for the same *req_id* are dropped, which lets the
+        chunk-transfer paths and the save-loop fallback both call this without
+        coordinating. The lock is held across the send because the fallback
+        runs on a different thread than the transfer path and ZMQ sockets are
+        not thread-safe.
+        """
+        if getattr(self, "proxy_side_channel", None) is None:
+            return
+
+        with self._prefill_done_lock:
+            if req_id in self._prefill_done_notified:
+                return
+            self._prefill_done_notified[req_id] = None
+            while len(self._prefill_done_notified) > _PREFILL_DONE_HISTORY:
+                self._prefill_done_notified.popitem(last=False)
+            self.proxy_side_channel.send(
+                msgspec.msgpack.encode(ProxyNotif(req_id=req_id))
+            )
+
     def batched_submit_put_task(
         self,
         keys: Sequence[CacheEngineKey],
@@ -392,8 +431,7 @@ class AscendPDSenderMixin:
                 # premature free and PagedTensorMemoryAllocator
                 # double-free corruption.
                 if transfer_spec.is_last_prefill:
-                    notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-                    self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+                    self.notify_prefill_done(transfer_spec.req_id)
                 return
 
         if self.pull_mode:
@@ -442,8 +480,7 @@ class AscendPDSenderMixin:
                     time.monotonic() + self._peer_alloc_backoff_ttl
                 )
             if transfer_spec.is_last_prefill:
-                notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-                self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+                self.notify_prefill_done(transfer_spec.req_id)
             return
 
         already_sent_indexes = set(alloc_response.already_sent_indexes)
@@ -484,8 +521,7 @@ class AscendPDSenderMixin:
             )
 
         if transfer_spec.is_last_prefill:
-            notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-            self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+            self.notify_prefill_done(transfer_spec.req_id)
 
     def _batched_submit_put_task_pull(
         self,
@@ -577,8 +613,7 @@ class AscendPDSenderMixin:
                     time.monotonic() + self._peer_alloc_backoff_ttl
                 )
             if transfer_spec.is_last_prefill:
-                notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-                self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+                self.notify_prefill_done(transfer_spec.req_id)
             return
 
         # Release already-sent objects, pin the rest
@@ -638,5 +673,4 @@ class AscendPDSenderMixin:
             )
 
         if transfer_spec.is_last_prefill:
-            notif_msg = ProxyNotif(req_id=transfer_spec.req_id)
-            self.proxy_side_channel.send(msgspec.msgpack.encode(notif_msg))
+            self.notify_prefill_done(transfer_spec.req_id)

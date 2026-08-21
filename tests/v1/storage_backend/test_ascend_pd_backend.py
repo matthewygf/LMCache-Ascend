@@ -7,6 +7,7 @@ hardware and are gated behind ``@pytest.mark.skipif``.
 """
 
 # Standard
+from collections import OrderedDict
 from typing import Tuple
 from unittest.mock import MagicMock, patch
 import threading
@@ -131,6 +132,13 @@ def _make_pd_backend_stub(
     )
     backend._partition_keys = lambda keys: AscendPDBackend._partition_keys(
         backend, keys
+    )
+
+    # Prefill-done notification state, normally set up by _init_sender.
+    backend._prefill_done_notified = OrderedDict()
+    backend._prefill_done_lock = threading.Lock()
+    backend.notify_prefill_done = lambda req_id: AscendPDBackend.notify_prefill_done(
+        backend, req_id
     )
 
     return backend
@@ -644,6 +652,30 @@ class TestAscendPDBackend:
         backend._remote_allocate.assert_not_called()
         # Should still send proxy notification for last prefill
         backend.proxy_side_channel.send.assert_called_once()
+
+    def test_notify_prefill_done_is_sent_once_per_request(self):
+        """Transfer path and save-loop fallback collapse to one notification.
+
+        The proxy counts one signal per rank, so a duplicate would leave stale
+        state behind and a missing one would hang it.
+        """
+        backend = _make_pd_backend_stub(role="sender")
+        backend.proxy_side_channel = MagicMock()
+
+        backend.notify_prefill_done("req_1")
+        backend.notify_prefill_done("req_1")
+        backend.notify_prefill_done("req_2")
+
+        assert backend.proxy_side_channel.send.call_count == 2
+
+    def test_notify_prefill_done_without_proxy_channel(self):
+        """pd_skip_proxy_notification leaves no socket; notifying is a no-op."""
+        backend = _make_pd_backend_stub(role="sender")
+        backend.proxy_side_channel = None
+
+        backend.notify_prefill_done("req_1")
+
+        assert backend._prefill_done_notified == OrderedDict()
 
     def test_handle_pull_done_releases_resources(self):
         """_handle_pull_done releases pinned MemObjs."""

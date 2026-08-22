@@ -146,16 +146,33 @@ class VLLMPagedMemNPUConnectorV2(VLLMPagedMemGPUConnectorV2):
         else:
             # vLLM v0.9.2 ...
             # kv_caches[0].shape: [2, num_pages, page_size, num_heads, head_size]
-            # 310P: [2, num_blocks, num_kv_heads * head_size // 16, block_size, 16]
-            # 910B: [2, num_blocks, block_size, num_kv_heads, head_size]
-            self.block_size = first_tensor.shape[-2]
+            # 310P NZ: [2, num_blocks, num_kv_heads * head_size // 16, block_size, 16]
+            # 910B:    [2, num_blocks, block_size, num_kv_heads, head_size]
+            # On 310P the NZ packed dim sits where 910B stores block_size, so
+            # page_buffer_size must use explicit block_size (shape[-2]), matching
+            # the PyTorch connector fix from LMCache-Ascend #66. Using
+            # shape[1]*shape[2] here silently under-counts slots and corrupts KV.
             if self.kv_format == KVCacheFormat.SEPARATE_KV:
-                # kv_caches[0]: [tuple(k,v)，tuple(k,v)]
+                # kv_caches[0]: [tuple(k,v), ...]
+                # 310P: [num_blocks, num_kv_heads * head_size // 16, block_size, 16]
+                # 910B: [num_blocks, block_size, num_kv_heads, head_size]
                 assert first_tensor.dim() >= 2
-                self.page_buffer_size = first_tensor.shape[0] * first_tensor.shape[1]
+                if self.is_310p:
+                    self.block_size = first_tensor.shape[-2]
+                    self.page_buffer_size = first_tensor.shape[0] * self.block_size
+                else:
+                    self.page_buffer_size = (
+                        first_tensor.shape[0] * first_tensor.shape[1]
+                    )
             else:
                 assert first_tensor.dim() == 5
-                self.page_buffer_size = first_tensor.shape[1] * first_tensor.shape[2]
+                if self.is_310p:
+                    self.block_size = first_tensor.shape[-2]
+                    self.page_buffer_size = first_tensor.shape[1] * self.block_size
+                else:
+                    self.page_buffer_size = (
+                        first_tensor.shape[1] * first_tensor.shape[2]
+                    )
 
         return self.kv_cache_pointers_on_gpu[idx]
 

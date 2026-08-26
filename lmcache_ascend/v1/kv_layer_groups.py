@@ -55,22 +55,58 @@ def _get_kv_cache_group_key_and_info(
     raise RuntimeError(f"Unknown KVCache type: {type(kv_cache)}")
 
 
+def _is_310p_nz_layout(shape: torch.Size) -> bool:
+    """True when *shape* is Ascend 310P NZ-packed KV (innermost tile == 16).
+
+    310P + LMCache forces NZ via the vllm-ascend adapt patch, so physical
+    layer shapes look like:
+
+    * MERGED  ``[2, num_blocks, packed, block_size, 16]``
+    * SEPARATE ``[num_blocks, packed, block_size, 16]``
+
+    rather than the 910B ND layouts
+
+    * MERGED  ``[2, num_blocks, block_size, heads, head_dim]``
+    * SEPARATE ``[num_blocks, block_size, heads, head_dim]``
+
+    Combining the SOC check with ``shape[-1] == 16`` avoids mis-classifying
+    ND caches on 310P (if NZ was not applied) and rare 910B ``head_dim=16``.
+    """
+    if len(shape) < 4 or int(shape[-1]) != 16:
+        return False
+    try:
+        # First Party
+        from lmcache_ascend.v1.npu_connector.npu_connectors import is_310p
+    except Exception:
+        return False
+    return bool(is_310p())
+
+
 def patched_hidden_dim_size(self) -> int:
-    """Return the size of the hidden dimension in this group."""
+    """Return the size of the hidden dimension in this group.
+
+    ``metadata.get_shapes()`` stores LMCache chunks as
+    ``[kv_size, num_layers, num_tokens, hidden_dim]``. The transfer kernels
+    then take ``hidden_dims = key_value.size(-1)``, so a wrong value here
+    silently corrupts store/retrieve.
+    """
     # hidden_dim_size = num_heads * head_size
     if len(self.shape) == 5:
-        # MHA
+        # MERGED: ND [2, nb, bs, heads, hd] or NZ [2, nb, packed, bs, 16]
+        if _is_310p_nz_layout(self.shape):
+            return self.shape[2] * self.shape[4]
         return self.shape[3] * self.shape[4]
     elif len(self.shape) == 4:
-        # NOTE(gingfung): Ascend separated format for KVCaches
-        # i.e. a tuple of kv (numblocks, blocksize, heads, headdim)
-        #      very unlikely, but potentially MLA with (1, ....)
+        # SEPARATE: ND (nb, bs, heads, hd) or NZ (nb, packed, bs, 16)
+        # shape[0]==1 would be an invalid single-block / MLA-confused layout.
         if self.shape[0] == 1:
             raise ValueError(f"Invalid shape for hidden dim size: {self.shape}")
 
+        if _is_310p_nz_layout(self.shape):
+            return self.shape[1] * self.shape[3]
         return self.shape[2] * self.shape[3]
     elif len(self.shape) == 3:
-        # MLA
+        # MLA / DSA flattened storage shape [nb, bs, total_hidden]
         return self.shape[2]
     else:
         raise ValueError(f"Invalid shape: {self.shape}")

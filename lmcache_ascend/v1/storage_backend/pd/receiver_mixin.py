@@ -125,8 +125,12 @@ class AscendPDReceiverMixin:
             allocated_keys.append(key)
             allocated_objs.append(mem_obj)
 
-        release_memory_objects(already_sent_objs)
-
+        # Keep already-sent pins (taken by ``_partition_keys``).  Upstream
+        # PDBackend does the same: ``contains(key, pin=True)`` without an
+        # immediate unpin.  With ``remove_after_retrieve`` on the decoder,
+        # releasing here lets the first consumer delete shared keys before
+        # a later already-sent request retrieves them → get_blocking miss /
+        # assert, or TP-inconsistent hits under shared prefixes.
         return AscendAllocResponse(
             already_sent_indexes=already_sent_indexes,
             remote_buffer_uuids=remote_buffer_uuids,
@@ -234,8 +238,7 @@ class AscendPDReceiverMixin:
         for mem_obj, key in zip(mem_objs, mem_keys, strict=False):
             self.put(key, mem_obj)
 
-        release_memory_objects(already_sent_objs)
-
+        # Keep already-sent pins — see ``_allocate_and_put`` (push mode).
         # Build a callback that sends PullDoneSignal AFTER the ack reply
         # has been sent on the REP socket.  This prevents the sender's
         # listener thread from processing the Done signal before the
@@ -277,6 +280,8 @@ class AscendPDReceiverMixin:
         already_sent_indexes, already_sent_objs, new_indexes = self._partition_keys(
             msg.keys
         )
+        # Pins in already_sent_objs are retained (see push ``_allocate_and_put``).
+        del already_sent_objs
 
         num_proxies = len(new_indexes)
 
@@ -343,8 +348,10 @@ class AscendPDReceiverMixin:
                 sender_id,
             )
 
-        release_memory_objects(already_sent_objs)
-
+        # Keep already-sent pins for resident MemoryObjs (same as push /
+        # pull-eager).  For ``ProxyMemoryObj``, ``ref_count_up`` is a no-op
+        # while ``ref_count_down`` would decref the shared transfer context
+        # and can send Done early — so we must not release here either.
         return PullReadyDoneAck(already_sent_indexes=already_sent_indexes), None
 
     def _send_pull_done_to_sender(self, sender_id: str, pull_id: str) -> None:

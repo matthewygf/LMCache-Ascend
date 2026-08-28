@@ -318,8 +318,10 @@ class AscendPDBackend(AscendPDSenderMixin, AscendPDReceiverMixin, PDBackend):
         already_sent_indexes : list[int]
             Indexes (into *keys*) of chunks that were already present.
         already_sent_objs : list[MemoryObj]
-            The pinned MemoryObj for each already-sent key.  The caller
-            **must** call :meth:`_release_pinned` when done.
+            The pinned MemoryObj for each already-sent key.  On alloc
+            *failure*, the caller must release these pins.  On success the
+            pins are intentionally retained so ``remove_after_retrieve``
+            cannot drop shared keys before a later consumer retrieves.
         new_indexes : list[int]
             Indexes (into *keys*) of chunks that need to be fetched.
         """

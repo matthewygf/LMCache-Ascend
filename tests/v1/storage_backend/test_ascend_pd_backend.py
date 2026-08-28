@@ -772,5 +772,135 @@ class TestAscendPDBackend:
         assert resp.alloc_failed is False
         # Only the new key was put
         backend.put.assert_called_once()
-        # Already-sent obj was unpinned
-        existing_obj.ref_count_down.assert_called()
+        # Already-sent pin must be retained (upstream PDBackend semantics)
+        # so remove_after_retrieve cannot drop the shared key early.
+        existing_obj.ref_count_up.assert_called_once()
+        existing_obj.ref_count_down.assert_not_called()
+
+    def test_allocate_and_put_already_sent_pin_blocks_remove(self):
+        """Kept already-sent pin keeps shared keys across remove_after_retrieve.
+
+        Simulates two decoder consumers of the same push-mode chunk: the
+        second AllocRequest pins the resident object; while that pin is
+        held, PDBackend.remove (ref_count==1 guard) must not delete it.
+        """
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.receiver_mixin import (
+            AscendPDReceiverMixin,
+        )
+
+        backend = _make_pd_backend_stub()
+
+        key0 = _make_key("shared_prefix")
+        # Real-ish refcount so remove()'s ==1 guard is meaningful.
+        ref = {"count": 1}
+
+        class _PinnedObj:
+            def ref_count_up(self):
+                ref["count"] += 1
+
+            def ref_count_down(self):
+                ref["count"] -= 1
+
+            def get_ref_count(self):
+                return ref["count"]
+
+        existing_obj = _PinnedObj()
+        backend.data[key0] = existing_obj
+
+        new_obj = _make_mock_mem_obj(address=1)
+        backend.allocate = MagicMock(return_value=new_obj)
+        backend.put = MagicMock()
+        backend.transfer_channel.get_local_buffer_refs.return_value = (
+            ["uuid-new"],
+            [1],
+        )
+
+        alloc_req = AllocRequest(
+            keys=[key0.to_string(), _make_key("new_key").to_string()],
+            fmt=MemoryFormat.KV_2LTD.value,
+            shape=[2, 2, 256, 512],
+            dtype="bfloat16",
+            last_chunk_toks=256,
+        )
+
+        with patch(
+            "lmcache_ascend.v1.storage_backend.pd.receiver_mixin.allocate_with_retry",
+            return_value=new_obj,
+        ):
+            resp = AscendPDReceiverMixin._allocate_and_put(backend, alloc_req)
+
+        assert resp.already_sent_indexes == [0]
+        assert ref["count"] == 2  # base + already-sent pin
+
+        # First consumer's remove_after_retrieve must leave the key in place.
+        # Mirror upstream PDBackend.remove ref_count==1 guard.
+        with backend.data_lock:
+            mem_obj = backend.data.get(key0)
+            assert mem_obj is existing_obj
+            if mem_obj.get_ref_count() == 1:
+                del backend.data[key0]
+        assert key0 in backend.data
+
+        # First consumer then drops its own ref; second consumer still pinned.
+        existing_obj.ref_count_down()
+        assert ref["count"] == 1
+        assert key0 in backend.data
+
+        # Second consumer remove can finally drop the entry.
+        with backend.data_lock:
+            mem_obj = backend.data.get(key0)
+            if mem_obj is not None and mem_obj.get_ref_count() == 1:
+                del backend.data[key0]
+        assert key0 not in backend.data
+        existing_obj.ref_count_down()
+        assert ref["count"] == 0
+
+    def test_pull_delay_already_sent_proxy_is_not_decref(self):
+        """Overlapping delay-pull must not ref_count_down existing proxies.
+
+        ProxyMemoryObj.ref_count_up is a no-op but ref_count_down decrefs the
+        shared PDTransferContext and can send Done while the first request
+        is still RDMA-reading.
+        """
+        # First Party
+        from lmcache_ascend.v1.proxy_memory_obj import ProxyMemoryObj
+        from lmcache_ascend.v1.storage_backend.pd.receiver_mixin import (
+            AscendPDReceiverMixin,
+        )
+
+        backend = _make_pd_backend_stub()
+        backend.delay_pull = True
+        backend.pull_mode = True
+        backend._kv_dtypes = [torch.bfloat16]
+        backend._fmt = MemoryFormat.KV_2LTD
+
+        key0 = _make_key("proxy_key")
+        proxy = MagicMock(spec=ProxyMemoryObj)
+        proxy.consumed = False
+        proxy.is_proxy = True
+        proxy.ref_count_up = MagicMock()
+        proxy.ref_count_down = MagicMock()
+        backend.data[key0] = proxy
+
+        msg = PullReadyNotif(
+            pull_id="pull_overlap",
+            keys=[key0.to_string()],
+            sender_buffer_uuids=["suuid-1"],
+            sender_mem_indexes=[0],
+            sender_id="sender_1",
+            sender_done_url="tcp://sender:9999",
+            fmt=MemoryFormat.KV_2LTD.value,
+            shape=list(DEFAULT_SHAPE),
+            dtype="bfloat16",
+            last_chunk_toks=256,
+        )
+
+        ack, post_ack_fn = AscendPDReceiverMixin._handle_pull_delay(
+            backend, msg, "sender_1"
+        )
+
+        assert ack.already_sent_indexes == [0]
+        assert post_ack_fn is None
+        proxy.ref_count_up.assert_called_once()
+        proxy.ref_count_down.assert_not_called()

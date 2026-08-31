@@ -74,8 +74,12 @@ class AscendPDSenderMixin:
             # after the ack-before-done reordering, but defensive),
             # buffer the pull_id here so the main thread can release
             # immediately after registration instead of waiting for
-            # the TTL sweep.
-            self._early_pull_done: set[str] = set()
+            # the TTL sweep.  Maps pull_id -> arrival timestamp so
+            # entries that are never matched (e.g. a stray/duplicate
+            # Done signal for a pull_id that never pins anything) are
+            # swept out by _sweep_expired_pull_pending instead of
+            # growing this set forever.
+            self._early_pull_done: dict[str, float] = {}
             # TTL in seconds for pull_pending entries.  If a receiver
             # crashes and never sends PullDoneSignal, pinned MemObjs are
             # released after this timeout to prevent memory leaks.
@@ -165,13 +169,24 @@ class AscendPDSenderMixin:
         This handles the case where a receiver crashes or becomes
         unreachable and never sends a PullDoneSignal.  Without this,
         the sender's pinned buffers would leak indefinitely.
+
+        Also sweeps stale ``_early_pull_done`` entries: a Done signal
+        that arrives for a pull_id which never registers in
+        ``_pull_pending`` (e.g. a stray/duplicate signal, or any future
+        code path that emits an unmatched Done) would otherwise sit in
+        that set forever, since pull_ids are one-shot UUIDs that no
+        later call ever looks up again.
         """
         now = time.monotonic()
         expired_ids: list[str] = []
+        expired_early_done: list[str] = []
         with self._pull_pending_lock:
             for pull_id, (pinned_at, _objs) in self._pull_pending.items():
                 if now - pinned_at > self._pull_pending_ttl:
                     expired_ids.append(pull_id)
+            for pull_id, arrived_at in self._early_pull_done.items():
+                if now - arrived_at > self._pull_pending_ttl:
+                    expired_early_done.append(pull_id)
         # Release outside the scan loop to keep the critical section small
         for pull_id in expired_ids:
             with self._pull_pending_lock:
@@ -187,6 +202,16 @@ class AscendPDSenderMixin:
                     pull_id,
                     len(pinned_objs),
                 )
+        if expired_early_done:
+            with self._pull_pending_lock:
+                for pull_id in expired_early_done:
+                    self._early_pull_done.pop(pull_id, None)
+            logger.warning(
+                "Pull mode: dropped %d stale unmatched early-Done "
+                "pull_id(s) after TTL (never registered in "
+                "_pull_pending).",
+                len(expired_early_done),
+            )
 
     def _wait_for_backpressure(self, num_new_pages: int) -> None:
         """Block until pinned pages drop below the high-water mark.
@@ -235,7 +260,10 @@ class AscendPDSenderMixin:
             entry = self._pull_pending.pop(pull_id, None)
             if entry is None:
                 # Main thread hasn't registered yet — buffer for later.
-                self._early_pull_done.add(pull_id)
+                # (Also reached for a pull_id that will *never* register,
+                # e.g. an all-already-sent pull; the TTL sweep in
+                # _sweep_expired_pull_pending bounds that case.)
+                self._early_pull_done[pull_id] = time.monotonic()
                 logger.debug(
                     "Pull mode: buffered early PullDoneSignal for "
                     "pull_id %s (main thread not yet registered).",
@@ -535,7 +563,7 @@ class AscendPDSenderMixin:
                 if pull_id in self._early_pull_done:
                     # Done signal arrived before we registered —
                     # release immediately, don't register.
-                    self._early_pull_done.discard(pull_id)
+                    self._early_pull_done.pop(pull_id, None)
                     early_done = True
                 else:
                     self._pull_pending[pull_id] = (
@@ -567,7 +595,7 @@ class AscendPDSenderMixin:
             # above registers it).  Just discard any early-done signal
             # if there were any.
             with self._pull_pending_lock:
-                self._early_pull_done.discard(pull_id)
+                self._early_pull_done.pop(pull_id, None)
             logger.debug(
                 "Pull mode: all objects already sent for pull_id %s.",
                 pull_id,

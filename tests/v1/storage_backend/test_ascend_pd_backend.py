@@ -452,6 +452,56 @@ class TestAscendPDBackend:
         assert ack.alloc_failed is True
         assert post_ack_fn is None
 
+    def test_pull_eager_all_already_sent_skips_done_signal(self):
+        """Pull-eager: when every key is already-sent, no post-ack callback
+        is returned.
+
+        Regression test: previously ``_handle_pull_eager`` unconditionally
+        returned a callback that sends ``PullDoneSignal`` even when nothing
+        was pulled. The sender never registers ``_pull_pending`` for such a
+        pull_id (see ``_batched_submit_put_task_pull``'s "all objects
+        already sent" branch), so that Done signal is permanently buffered
+        in the sender's ``_early_pull_done`` -- a one-shot-UUID-keyed leak
+        with no TTL sweep. The fix must skip the Done signal entirely
+        (mirroring ``_handle_pull_delay``'s ``num_proxies == 0`` guard).
+        """
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.receiver_mixin import (
+            AscendPDReceiverMixin,
+        )
+
+        backend = _make_pd_backend_stub()
+        existing_obj = _make_mock_mem_obj()
+        key = _make_key("already_sent_key")
+        backend.data[key] = existing_obj
+        backend.transfer_channel.batched_read = MagicMock(return_value=0)
+        backend._send_pull_done_to_sender = MagicMock()
+
+        msg = PullReadyNotif(
+            pull_id="pull_all_already_sent",
+            keys=[key.to_string()],
+            sender_buffer_uuids=["suuid-1"],
+            sender_mem_indexes=[0],
+            sender_id="sender_1",
+            sender_done_url="tcp://sender:9999",
+            fmt=MemoryFormat.KV_2LTD.value,
+            shape=list(DEFAULT_SHAPE),
+            dtype="bfloat16",
+            last_chunk_toks=256,
+        )
+
+        ack, post_ack_fn = AscendPDReceiverMixin._handle_pull_eager(
+            backend, msg, "sender_1"
+        )
+
+        assert isinstance(ack, PullReadyDoneAck)
+        assert ack.alloc_failed is False
+        assert ack.already_sent_indexes == [0]
+        # No new data was read, and no Done signal should ever be scheduled.
+        backend.transfer_channel.batched_read.assert_not_called()
+        assert post_ack_fn is None
+        backend._send_pull_done_to_sender.assert_not_called()
+
     def test_pull_delay_flow(self):
         """Pull-delay creates ProxyMemoryObj instances in data store."""
         # First Party
@@ -652,7 +702,7 @@ class TestAscendPDBackend:
         backend._pull_pending = {"pull_1": (time.monotonic(), [mock_obj])}
         backend._pull_pending_lock = threading.Lock()
         backend._pull_pending_pinned_count = 1
-        backend._early_pull_done = set()
+        backend._early_pull_done = {}
 
         AscendPDSenderMixin._handle_pull_done(backend, "pull_1")
 
@@ -671,7 +721,7 @@ class TestAscendPDBackend:
         backend._pull_pending = {}
         backend._pull_pending_lock = threading.Lock()
         backend._pull_pending_pinned_count = 0
-        backend._early_pull_done = set()
+        backend._early_pull_done = {}
 
         AscendPDSenderMixin._handle_pull_done(backend, "pull_early")
 
@@ -731,6 +781,32 @@ class TestAscendPDBackend:
         assert "expired_pull" not in backend._pull_pending
         mock_obj.ref_count_down.assert_called_once()
         assert backend._pull_pending_pinned_count == 0
+
+    def test_sweep_expired_pull_pending_clears_stale_early_done(self):
+        """Defense-in-depth: stale, unmatched ``_early_pull_done`` entries
+        are reclaimed by the TTL sweep instead of leaking forever.
+
+        Guards against any future code path that emits an unmatched
+        ``PullDoneSignal`` (a Done for a pull_id that never registers in
+        ``_pull_pending``) repeating the same unbounded-growth pattern as
+        the eager "all already sent" bug.
+        """
+        # First Party
+        from lmcache_ascend.v1.storage_backend.pd.sender_mixin import (
+            AscendPDSenderMixin,
+        )
+
+        backend = MagicMock()
+        backend._pull_pending = {}
+        backend._pull_pending_lock = threading.Lock()
+        backend._pull_pending_pinned_count = 0
+        backend._pull_pending_ttl = 0.001
+        backend._early_pull_done = {"stale_pull_id": 0.0}
+
+        time.sleep(0.01)
+        AscendPDSenderMixin._sweep_expired_pull_pending(backend)
+
+        assert "stale_pull_id" not in backend._early_pull_done
 
     def test_allocate_and_put_with_already_sent(self):
         """Already-sent keys are identified and not re-allocated."""

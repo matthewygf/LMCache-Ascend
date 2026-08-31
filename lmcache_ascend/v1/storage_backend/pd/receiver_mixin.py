@@ -171,6 +171,24 @@ class AscendPDReceiverMixin:
             msg.keys
         )
 
+        if not new_indexes:
+            # Nothing to pull -- every key was already-sent.  On the
+            # sender, ``_batched_submit_put_task_pull``'s "all objects
+            # already sent" branch never registers ``_pull_pending[pull_id]``
+            # in this case (there is nothing to pin), so a Done signal for
+            # this pull_id would never be matched.  The sender's
+            # ``_handle_pull_done`` treats an unmatched pull_id as "arrived
+            # early" and buffers it in ``_early_pull_done`` -- pull_ids are
+            # one-shot UUIDs that no later call ever revisits, so that
+            # buffered entry would otherwise leak forever.  Skip both the
+            # (no-op) RDMA read and the Done signal entirely, mirroring
+            # ``_handle_pull_delay``'s ``num_proxies == 0`` guard.
+            release_memory_objects(already_sent_objs)
+            return (
+                PullReadyDoneAck(already_sent_indexes=already_sent_indexes),
+                None,
+            )
+
         remote_buffer_uuids: list[str] = []
         remote_mem_indexes: list[int] = []
         mem_objs: list[MemoryObj] = []

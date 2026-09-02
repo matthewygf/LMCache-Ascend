@@ -13,6 +13,7 @@ import torch
 
 # First Party
 from lmcache_ascend import _build_info
+from lmcache_ascend.v1.npu_connector.npu_connectors import is_310p
 
 if _build_info.__framework_name__ == "pytorch":
     # First Party
@@ -44,6 +45,21 @@ def CreateNPUConnector(
     connector implementations.
     """
     use_gpu = need_gpu_interm_buffer(config)
+
+    # 310P vLLM KV caches use NZ (fractal) layout. Layerwise / CacheBlend
+    # connectors call single_layer_kv_transfer, which derives
+    # block_size/num_heads/head_dims from ND trailing dims and copies
+    # contiguous head*dim spans. On NZ that mis-addresses slots and
+    # over-copies (OOB / silent wrong KV). Multi-layer 310P has a
+    # dedicated NZ kernel; layerwise does not yet. Fail closed before
+    # touching NPU runtime.
+    if config.use_layerwise and is_310p():
+        raise ValueError(
+            "use_layerwise / enable_blending is not supported on "
+            "Ascend 310P: NZ KV layout is incompatible with "
+            "single_layer_kv_transfer. Disable use_layerwise (and "
+            "blending), or use a 910B device."
+        )
 
     num_gpus = torch.npu.device_count()
     local_rank = metadata.worker_id % num_gpus

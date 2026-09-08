@@ -717,6 +717,10 @@ if not LMCACHE_ASCEND_PATCHED:
     _patch_ops()
     if is_vllm:
         _patch_get_vllm_torch_dev()
+    # SGLang and vLLM both construct engines via CreateGPUConnector;
+    # without this rebind Ascend keeps the upstream CUDA factory and never
+    # installs SGLangLayerwiseNPUConnector / VLLMPagedMemNPUConnector*.
+    if is_vllm or is_sgl:
         _patch_gpu_connector()
 
     _patch_hash_token()

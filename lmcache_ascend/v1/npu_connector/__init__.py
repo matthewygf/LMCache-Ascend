@@ -87,7 +87,20 @@ def CreateNPUConnector(
         hidden_dim_size = num_kv_head * head_dim
         kv_dtype = metadata.kv_dtype
 
-        if config.use_layerwise:
+        # Ascend SGLang 0.5.2–0.5.8 always constructs LMCacheLayerwiseConnector
+        # (retrieve_layer / store_layer). Default ``use_layerwise`` is False, and
+        # the empty ``SGLangNPUConnector`` subclass still delegates to upstream
+        # CUDA sgl kernels Ascend ``c_ops`` does not provide. Default to the
+        # layerwise NPU connector so README ``--enable-lmcache`` works; allow
+        # an explicit extra_config opt-out for experiments.
+        force_non_layerwise = False
+        if hasattr(config, "get_extra_config_value"):
+            force_non_layerwise = bool(
+                config.get_extra_config_value("force_sglang_non_layerwise", False)
+            )
+        use_sgl_layerwise = config.use_layerwise or not force_non_layerwise
+
+        if use_sgl_layerwise:
             conn = SGLangLayerwiseNPUConnector(
                 hidden_dim_size,
                 num_layer,

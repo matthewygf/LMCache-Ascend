@@ -313,11 +313,39 @@ class LMCacheAscendConnectorV1Impl(LMCacheConnectorV1Impl):
         return local_present
 
     def _may_register_store_after_wait_for_save(self, request: "Request") -> bool:
+        """Whether ``get_finished`` must delay GPU free until after wait_for_save.
+
+        Under ``store_async``, vLLM (especially MTP / speculative decode) can
+        call ``get_finished`` *before* ``wait_for_save``. Returning False here
+        reports ``finished_sending`` immediately and frees paged KV blocks
+        while a later store still needs to D2H them.
+
+        Ascend's ``_local_persist_skip`` can still store into LocalCPU even
+        when ``save_spec.can_save`` is False (e.g. RequestTracker seeds
+        ``num_saved_tokens`` from LMCache hits so the first step is below the
+        next chunk boundary). Those persist-only stores must be registered
+        too — otherwise store_async reads freed/reused GPU pages and poisons
+        LocalCPU. Recommended GLM configs enable both ``store_async`` and MTP.
+        """
         if self.kv_role == "kv_consumer":
             return False
         save_spec = request.save_spec
         if save_spec is None:
             return False
+
+        # Persist-only path: can_save=False but wait_for_save may still D2H a
+        # disk/remote hit into LocalCPU. Conservative register on can_load +
+        # local_cpu avoids a lookup here; false positives only delay free until
+        # wait_for_save + get_finished_stores see no pending async store.
+        load_spec = getattr(request, "load_spec", None)
+        if (
+            getattr(self.config, "local_cpu", False)
+            and load_spec is not None
+            and load_spec.can_load
+            and load_spec.lmcache_cached_tokens > 0
+        ):
+            return True
+
         if not save_spec.can_save and self.kv_role != "kv_producer":
             return False
         return save_spec.skip_leading_tokens != len(request.token_ids)

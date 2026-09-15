@@ -118,6 +118,21 @@ class AscendLMCacheEngine(LMCacheEngine):
         if self.kv_events_enabled and self.is_store_async:
             self.kv_events = ThreadSafeEventList()
 
+    def _is_sync_pd_backend(self) -> bool:
+        """Whether PD ``remove`` leaves refcount cleanup to the cache engine.
+
+        ``AscendPDBackend`` inherits upstream ``PDBackend.remove``, which does
+        **not** call ``ref_count_down`` (the sync-PD contract). Retrieve must
+        therefore decref after ``remove_after_retrieve``.
+
+        Supported lmcache ``v0.4.4`` (``LMCACHE_UPSTREAM_TAG``) does not define
+        this helper on ``LMCacheEngine``. Without an Ascend override, the
+        decoder path in ``examples/disagg_prefill/1p1d`` raises
+        ``AttributeError`` after a successful ``batched_to_gpu`` — once the
+        first key has already been removed from the PD store.
+        """
+        return bool(getattr(self.config, "enable_pd", False))
+
     def _ensure_store_worker(self) -> None:
         if self._store_queue is not None:
             return
